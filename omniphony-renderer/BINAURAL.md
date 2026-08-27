@@ -28,6 +28,33 @@ reverb send, and head rotation has no effect on it. Level is unity overall
 (no +10 dB LFE convention), matching the speaker path's untouched one-hot
 routing.
 
+Unity stays the default, but it is now adjustable. `render.lfe_gain` trims the
+decoded `LFE`/`LFE2` channels in dB before rendering:
+
+```yaml
+render:
+  lfe_gain: 6.0   # dB; 0 = unity (default), accepted range -60…+20
+```
+
+Because it is an *input* trim rather than part of the binaural stage, one
+setting covers every output mode — the LFE keeps its trim whether it is routed
+direct to a sub, fed to both ears as above, or spatialized by the virtual bed.
+It does not touch bass carried by other channels or by objects, and it is
+unrelated to the per-speaker output gains.
+
+Two things worth knowing before reaching for the top of the range. `+10 dB` is
+the in-band LFE monitoring convention, so it restores that relationship rather
+than inventing one; and the trim spends headroom. With `auto_gain: true` the
+gain stage reduces output permanently on the first clip it sees, so a boosted
+LFE transient quietens everything after it — prefer a host-side limiter, or
+leave room in `master_gain`, if you run the trim hot.
+
+A declared live option (`renderer::options`), so it is tunable at runtime over
+OSC — `/omniphony/control/option ["lfe_gain", <dB>]`, or the dedicated
+`/omniphony/control/lfe_gain [f32 dB]` — persisted back to the config on
+change, and rendered as a control in the Studio. There is no CLI flag: like
+every registry option, it is set in the config file or over OSC.
+
 ## Enabling it
 
 Set the output mode in `~/.config/omniphony/config.yaml`:

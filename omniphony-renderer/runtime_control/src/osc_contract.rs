@@ -77,6 +77,10 @@ pub const CONTROL_AUDIO_OUTPUT_FILE_FORMAT: &str = "/omniphony/control/audio/out
 pub const CONTROL_AUDIO_SAMPLE_RATE: &str = "/omniphony/control/audio/sample_rate";
 pub const CONTROL_AUTO_GAIN: &str = "/omniphony/control/auto_gain";
 pub const CONTROL_AUTO_GAIN_CEILING: &str = "/omniphony/control/auto_gain_ceiling";
+/// `[f32 dB]` — trim on the decoded `LFE`/`LFE2` input channels, 0 = unity.
+/// A plain control rather than a `realtime/` one: a trim is set once and left,
+/// so it needs neither the sequence numbering nor the state echo a fader does.
+pub const CONTROL_LFE_GAIN: &str = "/omniphony/control/lfe_gain";
 // Editable backend file (e.g. the scriptable backend's `.lua`). Content is owned
 // by the renderer, so the editor reads/writes it over OSC rather than via a
 // cross-host path. `get [backend_id, key]` replies STATE_BACKEND_FILE_CONTENT;
@@ -516,6 +520,7 @@ pub const ALL_CONTROL: &[&str] = &[
     CONTROL_AUDIO_SAMPLE_RATE,
     CONTROL_AUTO_GAIN,
     CONTROL_AUTO_GAIN_CEILING,
+    CONTROL_LFE_GAIN,
     CONTROL_BACKEND_FILE_GET,
     CONTROL_BACKEND_FILE_LIST,
     CONTROL_BACKEND_FILE_PUT,

@@ -168,6 +168,12 @@ pub struct RenderConfig {
     pub auto_gain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_gain_ceiling_db: Option<f32>,
+    /// Trim applied to the decoded `LFE`/`LFE2` input channels, in dB
+    /// (`render.lfe_gain`). 0 = unity, the default, at which the key is omitted
+    /// and the render path is untouched. An input trim, applied before the
+    /// renderer, so it holds for every output mode; see `LiveParams::lfe_gain_db`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lfe_gain: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bed_conform: Option<bool>,
     /// How channel-based (non-object) content is rendered: `host` (let mpv/the

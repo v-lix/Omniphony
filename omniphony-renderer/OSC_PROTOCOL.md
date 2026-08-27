@@ -215,6 +215,14 @@ Common control addresses include:
 - `/omniphony/control/input/apply`
 - `/omniphony/control/audio/output_devices/refresh`
 - `/omniphony/control/gain`
+- `/omniphony/control/lfe_gain` — `[f32 dB]`, trim on the decoded `LFE`/`LFE2`
+  input channels; 0 = unity (the default), accepted range −60…+20 dB, values
+  outside it clamped and non-finite ones ignored. Applied before rendering, so
+  it holds for every output mode; unrelated to `/speaker/{idx}/gain`, which
+  trims an output speaker. A declared live option, so this address is the
+  dedicated alias of `/omniphony/control/option ["lfe_gain", <dB>]` and the
+  value appears in the snapshot's `options` block rather than beside
+  `masterGain`.
 - `/omniphony/control/object/{idx}/mute`
 - `/omniphony/control/speaker/{idx}/gain`
 - `/omniphony/control/spread/min`

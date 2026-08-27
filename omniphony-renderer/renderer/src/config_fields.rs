@@ -237,6 +237,21 @@ render_field! {
 }
 
 render_field! {
+    /// Trim applied to the decoded `LFE`/`LFE2` input channels, in dB
+    /// (`render.lfe_gain`). Live param, tunable via
+    /// `/omniphony/control/lfe_gain`. Default 0 dB — unity, at which the key is
+    /// omitted from the file and the render path does no extra work.
+    ///
+    /// Same 0.01 dB write tolerance as `master_gain`: below that is inaudible,
+    /// and it keeps a round-trip through the live path from re-adding a key the
+    /// user never set. Accepted range is `LFE_GAIN_MIN_DB`…`LFE_GAIN_MAX_DB`,
+    /// enforced by `clamp_lfe_gain_db`.
+    pub lfe_gain: f32 = 0.0,
+    field = lfe_gain,
+    eq = |a: &f32, b: &f32| (a - b).abs() <= 0.01
+}
+
+render_field! {
     /// Loudness metadata correction toward -31 dBFS (`render.use_loudness`).
     pub use_loudness: bool = false,
     field = use_loudness,
@@ -452,10 +467,75 @@ pub mod hrir_update_lattice {
     }
 }
 
+/// Floor of the accepted `render.lfe_gain` range, in dB. Deep enough to be an
+/// effective mute, so the one field serves cutting the LFE as well as boosting
+/// it — a headphone rig with too much bass wants the other direction.
+pub const LFE_GAIN_MIN_DB: f32 = -60.0;
+
+/// Ceiling of the accepted `render.lfe_gain` range, in dB. Above the +10 dB
+/// in-band LFE monitoring convention, which is the largest trim with an
+/// established meaning, leaving a little room past it for deliberate use.
+pub const LFE_GAIN_MAX_DB: f32 = 20.0;
+
+/// Clamp a client-supplied LFE trim into the accepted range, mapping a
+/// non-finite value to the 0 dB default rather than rejecting the message —
+/// the engine drops bad input instead of erroring, per the OSC contract.
+///
+/// Lives here beside the descriptor rather than at any one call site: the OSC
+/// handler, the config seed and the CLI writer all validate through it, so the
+/// three cannot drift on what the range is.
+pub fn clamp_lfe_gain_db(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(LFE_GAIN_MIN_DB, LFE_GAIN_MAX_DB)
+    } else {
+        lfe_gain::DEFAULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::RenderConfig;
     use crate::live_params::HrirUpdateLattice;
+
+    #[test]
+    fn lfe_gain_round_trips_and_omits_the_default() {
+        let mut cfg = RenderConfig::default();
+        assert_eq!(
+            super::lfe_gain::get(&cfg),
+            None,
+            "an absent key must stay absent"
+        );
+
+        super::lfe_gain::store(&mut cfg, 10.0);
+        assert_eq!(super::lfe_gain::get(&cfg), Some(10.0));
+
+        // Back to unity: the key leaves the file rather than being written as 0.
+        super::lfe_gain::store(&mut cfg, super::lfe_gain::DEFAULT);
+        assert_eq!(super::lfe_gain::get(&cfg), None);
+        assert!(cfg.lfe_gain.is_none(), "the default must not be written");
+    }
+
+    #[test]
+    fn lfe_gain_write_tolerance_matches_master_gain() {
+        // Sub-0.01 dB is inaudible and must not re-add a key the user never set.
+        let mut cfg = RenderConfig::default();
+        super::lfe_gain::store(&mut cfg, 0.005);
+        assert_eq!(super::lfe_gain::get(&cfg), None);
+    }
+
+    #[test]
+    fn lfe_gain_clamps_to_the_declared_range() {
+        assert_eq!(super::clamp_lfe_gain_db(6.0), 6.0);
+        assert_eq!(super::clamp_lfe_gain_db(999.0), super::LFE_GAIN_MAX_DB);
+        assert_eq!(super::clamp_lfe_gain_db(-999.0), super::LFE_GAIN_MIN_DB);
+    }
+
+    #[test]
+    fn a_non_finite_lfe_gain_falls_back_to_unity() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(super::clamp_lfe_gain_db(bad), super::lfe_gain::DEFAULT);
+        }
+    }
 
     #[test]
     fn hrir_lattice_round_trips_and_omits_the_default() {

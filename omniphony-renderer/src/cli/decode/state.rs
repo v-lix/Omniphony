@@ -186,6 +186,11 @@ pub struct OutputState {
     pub drc_gain: f32,
     pub drc_ramp_samples_remaining: u32,
     pub drc_target_gain: f32,
+    /// LFE trim multiplier in force, slewed toward `render.lfe_gain` across
+    /// decoded frames so a live change cannot step the waveform. A listener
+    /// setting rather than stream state, so nothing resets it between segments
+    /// — it lives as long as the handler does.
+    pub lfe_gain_current: f32,
 }
 
 impl Default for OutputState {
@@ -207,6 +212,7 @@ impl Default for OutputState {
             drc_gain: 1.0,
             drc_ramp_samples_remaining: 0,
             drc_target_gain: 1.0,
+            lfe_gain_current: 1.0,
         }
     }
 }

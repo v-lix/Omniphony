@@ -240,12 +240,16 @@ impl<'a> SampleWriteCoordinator<'a> {
                     );
                 }
 
-                let drc_weight = renderer
-                    .renderer_control()
-                    .live
-                    .read()
-                    .drc_weight
-                    .clamp(0.0, 1.0);
+                // One read for both: the DRC weight and the LFE trim, which the
+                // object and bed branches below apply identically.
+                let (drc_weight, lfe_gain_db) = {
+                    let control = renderer.renderer_control();
+                    let live = control.live.read();
+                    (live.drc_weight.clamp(0.0, 1.0), live.lfe_gain_db)
+                };
+                let lfe_target = orender_engine::render::lfe_gain_linear(lfe_gain_db);
+                let lfe_ramp_samples =
+                    frame.sampling_frequency as f32 * renderer::spatial_renderer::GAIN_SLEW_SECS;
                 self.output.drc_target_gain = if drc_weight >= 1.0 {
                     frame.drc_gain
                 } else if drc_weight <= 0.0 {
@@ -272,6 +276,12 @@ impl<'a> SampleWriteCoordinator<'a> {
                         &mut self.output.drc_gain,
                         self.output.drc_target_gain,
                         &mut self.output.drc_ramp_samples_remaining,
+                        orender_engine::render::LfeTrim {
+                            labels: &frame.channel_labels,
+                            target: lfe_target,
+                            current: &mut self.output.lfe_gain_current,
+                            ramp_samples: lfe_ramp_samples,
+                        },
                     );
                     let pcm_data_f32 = &pcm_f32_scratch;
 
@@ -517,6 +527,12 @@ impl<'a> SampleWriteCoordinator<'a> {
                         &mut self.output.drc_gain,
                         self.output.drc_target_gain,
                         &mut self.output.drc_ramp_samples_remaining,
+                        orender_engine::render::LfeTrim {
+                            labels: &frame.channel_labels,
+                            target: lfe_target,
+                            current: &mut self.output.lfe_gain_current,
+                            ramp_samples: lfe_ramp_samples,
+                        },
                     );
                     let (pcm_data_f32, render_channel_count) =
                         self.spatial.channel_objects.process_and_extend(

@@ -399,6 +399,9 @@ impl SpatialRenderer {
             use_loudness,
             auto_gain,
             auto_gain_ceiling_db: crate::config_fields::auto_gain_ceiling_db::DEFAULT,
+            // Unity; seeded from `render.lfe_gain` by the CLI bootstrap and the
+            // embedded host, exactly like the options below.
+            lfe_gain_db: crate::config_fields::lfe_gain::DEFAULT,
             distance_model,
             distance_model_metric: crate::spatial_vbap::DistanceMetric::default(),
             distance_diffuse_metric: crate::spatial_vbap::DistanceMetric::default(),

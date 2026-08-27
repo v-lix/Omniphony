@@ -88,6 +88,11 @@ pub struct Engine {
     drc_gain: f32,
     drc_target_gain: f32,
     drc_ramp_samples_remaining: u32,
+    /// LFE trim multiplier in force, slewed toward `render.lfe_gain` across
+    /// decoded frames so a live change cannot step the waveform. Deliberately
+    /// not reset by [`Engine::reset`]: it is a listener setting, not stream
+    /// state, so a seek must not re-slew it from unity.
+    lfe_gain_current: f32,
     /// DRC mode last pushed to the bridge (selects which DRC words the decoder
     /// extracts → drives `frame.drc_gain`). Synced from the live param each
     /// `process` so config + OSC changes reach the decoder, mirroring the CLI's
@@ -273,6 +278,7 @@ impl Engine {
             drc_gain: 1.0,
             drc_target_gain: 1.0,
             drc_ramp_samples_remaining: 0,
+            lfe_gain_current: 1.0,
             applied_drc_mode: String::new(),
             frame_events: Vec::new(),
             pcm_f32_buf: Vec::new(),
@@ -1206,14 +1212,14 @@ impl Engine {
             }
         }
 
-        // DRC target from the stream gain, weighted by the live DRC weight.
-        let drc_weight = self
-            .renderer
-            .renderer_control()
-            .live
-            .read()
-            .drc_weight
-            .clamp(0.0, 1.0);
+        // DRC target from the stream gain, weighted by the live DRC weight; the
+        // LFE trim rides along in the same read rather than taking the lock a
+        // second time for one scalar.
+        let (drc_weight, lfe_gain_db) = {
+            let control = self.renderer.renderer_control();
+            let live = control.live.read();
+            (live.drc_weight.clamp(0.0, 1.0), live.lfe_gain_db)
+        };
         self.drc_target_gain = if drc_weight >= 1.0 {
             frame.drc_gain
         } else if drc_weight <= 0.0 {
@@ -1231,6 +1237,12 @@ impl Engine {
             &mut self.drc_gain,
             self.drc_target_gain,
             &mut self.drc_ramp_samples_remaining,
+            render::LfeTrim {
+                labels: &frame.channel_labels,
+                target: render::lfe_gain_linear(lfe_gain_db),
+                current: &mut self.lfe_gain_current,
+                ramp_samples: sample_rate as f32 * renderer::spatial_renderer::GAIN_SLEW_SECS,
+            },
         );
 
         // Two upmix stages now that the bed PCM exists. First the phantom pre-stage

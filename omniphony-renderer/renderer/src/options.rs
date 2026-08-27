@@ -391,6 +391,43 @@ pub static LIVE_OPTIONS: &[OptionSpec] = &[
             }
         },
     },
+    OptionSpec {
+        key: "lfe_gain",
+        kind: OptionKind::Float {
+            min: crate::config_fields::LFE_GAIN_MIN_DB,
+            max: crate::config_fields::LFE_GAIN_MAX_DB,
+            step: 0.5,
+        },
+        default: OptionDefault::Float(crate::config_fields::lfe_gain::DEFAULT),
+        // No REPLAN: the trim is a scalar the PCM conversion reads every frame,
+        // it synthesizes no objects and changes no topology.
+        flags: OptionFlags::PERSIST,
+        i18n_key: "renderer.lfeGainLabel",
+        help_i18n_key: Some("help.lfeGain"),
+        legacy_control_addr: "/omniphony/control/lfe_gain",
+        set: |live, raw| {
+            let v = match raw {
+                RawOptionValue::Number(n) => *n as f32,
+                RawOptionValue::Str(s) => s.trim().parse::<f32>().ok()?,
+                RawOptionValue::Bool(_) => return None,
+            };
+            if !v.is_finite() {
+                return None;
+            }
+            let v = crate::config_fields::clamp_lfe_gain_db(v);
+            live.lfe_gain_db = v;
+            Some(format!("{v}"))
+        },
+        get_json: |live| live.lfe_gain_db.into(),
+        config_store: |render, live| {
+            crate::config_fields::lfe_gain::store(render, live.lfe_gain_db)
+        },
+        config_seed: |live, render| {
+            if let Some(db) = crate::config_fields::lfe_gain::get(render) {
+                live.lfe_gain_db = crate::config_fields::clamp_lfe_gain_db(db);
+            }
+        },
+    },
 ];
 
 /// Look an option up by its canonical key (the `/control/option` key argument).

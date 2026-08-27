@@ -1120,6 +1120,23 @@ pub struct LiveParams {
     /// leaving headroom so corrections fire less often. Default −1 dBFS.
     pub auto_gain_ceiling_db: f32,
 
+    /// Trim applied to the decoded `LFE`/`LFE2` input channels, in dB
+    /// (0 = unity, the default). Live-tunable via
+    /// `/omniphony/control/lfe_gain`.
+    ///
+    /// An *input* trim, not an output one: it is applied to the labelled LFE
+    /// lanes before rendering, so it follows the channel wherever the renderer
+    /// routes it — direct to a sub on a speaker layout, to both ears in
+    /// binaural, or VBAP-panned when the virtual bed spatializes it. The
+    /// per-speaker [`SpeakerLiveParams::gain`] is the output-side counterpart
+    /// and is unrelated; so is the stream's own per-channel metadata gain,
+    /// which stays decoder-authoritative.
+    ///
+    /// Unity is deliberate at the default: the binaural stage documents that it
+    /// applies no +10 dB LFE convention of its own (see `binaural`, issue
+    /// #156), and this trim leaves that policy alone until a user moves it.
+    pub lfe_gain_db: f32,
+
     /// Distance attenuation model currently applied by the renderer.
     pub distance_model: crate::spatial_vbap::DistanceModel,
 

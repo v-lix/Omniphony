@@ -275,6 +275,7 @@ mod registry {
                 RawOptionValue::Number(0.75),
             ),
             ("hrir_update_lattice", RawOptionValue::Str("coarse")),
+            ("lfe_gain", RawOptionValue::Number(6.0)),
         ]
     }
 
