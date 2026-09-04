@@ -24,7 +24,7 @@
 //!
 //! Families inherit from [`SourceFamily::Generic`]: a family without an
 //! explicit mode takes the generic mode when one is set, else its built-in
-//! default (Auro-3D: sphere; everything else: room); a family without a
+//! default (DTS and Auro-3D: sphere; everything else: room); a family without a
 //! layout uses the generic layout. The generic family is also what a bridge
 //! that declares no family, or an unknown one, gets.
 
@@ -112,11 +112,11 @@ impl SourceFamily {
     }
 
     /// The mode a family runs in when neither it nor the generic family
-    /// sets one: Auro-3D is a sphere by definition, everything else keeps
-    /// the room model it always had.
+    /// sets one: DTS and Auro-3D use their declared speaker directions;
+    /// everything else keeps the room model it always had.
     pub fn builtin_mode(self) -> PlacementMode {
         match self {
-            Self::Auro => PlacementMode::Sphere,
+            Self::Dts | Self::Auro => PlacementMode::Sphere,
             _ => PlacementMode::Room,
         }
     }
@@ -283,17 +283,20 @@ mod tests {
     }
 
     #[test]
-    fn builtin_defaults_make_auro_a_sphere_and_the_rest_a_room() {
+    fn builtin_defaults_make_dts_and_auro_spheres_and_the_rest_rooms() {
         let state = PlacementState::default();
         assert!(state.is_default());
         assert_eq!(
             state.effective_mode(SourceFamily::Auro),
             PlacementMode::Sphere
         );
+        assert_eq!(
+            state.effective_mode(SourceFamily::Dts),
+            PlacementMode::Sphere
+        );
         for family in [
             SourceFamily::Generic,
             SourceFamily::Dolby,
-            SourceFamily::Dts,
             SourceFamily::Pcm,
         ] {
             assert_eq!(

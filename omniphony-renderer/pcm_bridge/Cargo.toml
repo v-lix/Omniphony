@@ -1,0 +1,19 @@
+[package]
+name = "pcm_bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PCM decoder bridge: presents host-decoded interleaved PCM, with explicit per-channel speaker labels, as a channel bed for the orender spatial renderer"
+repository.workspace = true
+
+# cdylib: the loadable .so/.dll/.dylib bridge plugin.
+# rlib: lets the unit tests link the crate.
+[lib]
+name = "pcm_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bridge_api.workspace = true
+abi_stable.workspace = true
+log.workspace = true
