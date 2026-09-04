@@ -110,10 +110,10 @@ impl Family {
     }
 
     /// The renderer's built-in default when neither the family nor the
-    /// generic one sets a mode: Auro-3D is a sphere, the rest a room.
+    /// generic one sets a mode: DTS and Auro-3D are spheres, the rest rooms.
     fn builtin_mode(self) -> PlacementMode {
         match self {
-            Self::Auro => PlacementMode::Sphere,
+            Self::Dts | Self::Auro => PlacementMode::Sphere,
             _ => PlacementMode::Room,
         }
     }
@@ -970,12 +970,24 @@ mod tests {
             { "name": "LFE", "coord_mode": "cartesian", "x": 0.0, "y": 1.0, "z": 0.0, "spatialize": false, "gain_db": -3.0 },
             { "name": "Ls", "coord_mode": "polar", "azimuth": -135.0, "elevation": 0.0, "distance": 1.0 }
         ] });
-        // No mode anywhere: the built-in default, room.
+        // No mode anywhere: each family uses its built-in default.
         let app = app_with_placement(serde_json::json!({ "generic": { "layout": entries } }));
         let mut catalog = ChannelCatalog::default();
         catalog.refresh(&app);
         assert_eq!(
             family_placement(&app, Family::Dolby).effective_mode,
+            PlacementMode::Room
+        );
+        assert_eq!(
+            family_placement(&app, Family::Dts).effective_mode,
+            PlacementMode::Sphere
+        );
+        assert_eq!(
+            family_placement(&app, Family::Auro).effective_mode,
+            PlacementMode::Sphere
+        );
+        assert_eq!(
+            family_placement(&app, Family::Pcm).effective_mode,
             PlacementMode::Room
         );
         let channels = effective_channels_for(&catalog, &app, Family::Dolby);

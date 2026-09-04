@@ -46,7 +46,7 @@ The bridge declares the family of the current presentation
 | Family | Declared by | Built-in default mode |
 |---|---|---|
 | `dolby` | AC-3, E-AC-3, TrueHD (with or without objects) | Room |
-| `dts` | DTS, DTS-HD, DTS:X | Room (its ETSI angles serve Sphere) |
+| `dts` | DTS, DTS-HD, DTS:X | Sphere |
 | `auro` | an unfolded Auro-3D carrier | Sphere |
 | `pcm` | the reference WAV bridge | Room |
 | `generic` | anything else, or an older bridge | Room |
