@@ -70,6 +70,15 @@ declares:
 | `auro` | Auro-3D | an unfolded Auro-3D carrier | Sphere |
 | `iamf` | Eclipsa / IAMF | IAMF (ITU BS.2051 loudspeaker layouts) | Sphere |
 
+The PCM bridge carries PCM a host decoded itself. Its streams are `pcm`
+unless the host names the original codec (`input_codec`), and it declares
+the two families that can then name, with the harletty bridge's defaults:
+
+| Family | Label | Covers | Default mode on speakers |
+|---|---|---|---|
+| `dolby` | Dolby | host-decoded AC-3, E-AC-3, TrueHD | Room |
+| `dts` | DTS | host-decoded DTS | Room |
+
 A family the config names but no loaded bridge declares stays in the table,
 undeclared: its settings are kept and saved back, and apply again once a
 bridge declares it. Studio offers the families the renderer publishes
