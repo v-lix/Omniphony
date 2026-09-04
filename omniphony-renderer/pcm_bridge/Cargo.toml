@@ -1,0 +1,18 @@
+[package]
+name = "pcm_bridge"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "PCM decoder bridge: presents host-decoded interleaved PCM, with explicit per-channel speaker labels, as a channel bed for the orender spatial renderer"
+repository = "https://github.com/mgth/Omniphony"
+
+# cdylib: the loadable .so/.dll/.dylib bridge plugin.
+# rlib: lets the unit tests link the crate.
+[lib]
+name = "pcm_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bridge_api = { version = "0.3.0", path = "../bridge_api" }
+abi_stable = "0.11"
+log = "0.4"
