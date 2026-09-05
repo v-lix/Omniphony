@@ -265,6 +265,12 @@ impl FormatBridge for PcmBridge {
     fn set_drc_mode(&mut self, _mode: RStr<'_>) -> bool {
         false
     }
+
+    /// Nothing to add: the host handed this bridge the PCM and already knows
+    /// what it is.
+    fn presentation_name(&self) -> RString {
+        RString::new()
+    }
 }
 
 #[cfg(test)]

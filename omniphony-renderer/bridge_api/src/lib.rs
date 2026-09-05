@@ -274,6 +274,23 @@ pub trait FormatBridge: Send + Sync + 'static {
     ///
     /// Returns `true` if the mode was successfully applied.
     fn set_drc_mode(&mut self, mode: RStr<'_>) -> bool;
+
+    /// What the stream presents itself as, when the container does not say it.
+    ///
+    /// Empty for every stream whose name the host already knows: the codec id
+    /// the container carries is the answer for Atmos, for DTS:X and for plain
+    /// multichannel alike, and repeating it here would only give the host a
+    /// second opinion to reconcile.
+    ///
+    /// It is non-empty for a presentation the bitstream hides. An Auro-Codec
+    /// carrier is the case this exists for: it is an ordinary DTS-HD MA track
+    /// until a decoder has read the side channel out of its low bits, so no
+    /// container field and no syncword names it, and "Auro 11.1" is a fact
+    /// only the bridge that unfolded it can state.
+    ///
+    /// A live, observable fact like [`has_objects`], not a latched one: it is
+    /// empty until a presentation is confirmed and returns to empty on reset.
+    fn presentation_name(&self) -> RString;
 }
 
 /// Owned, heap-allocated bridge trait object.
