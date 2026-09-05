@@ -57,6 +57,20 @@ pub struct Engine {
     bridge: LoadedBridge,
     renderer: SpatialRenderer,
     sample_rate: u32,
+    /// Sampling frequency of the last frame the bridge actually decoded, or 0
+    /// before the first one. The counterpart to `sample_rate`, which is only
+    /// what the host *asked* for: the two agree for every format whose rate the
+    /// host can read ahead of decoding, and disagree wherever it cannot - a DTS
+    /// XLL extension over a 48 kHz core decodes at 96 kHz while the core sync
+    /// word the host parsed says 48.
+    ///
+    /// Deliberately not cleared by [`Engine::reset`] or on a segment boundary,
+    /// unlike the `last_*` fields below. Those describe one frame's content, so
+    /// a stale value would be a wrong answer; this describes the stream, and a
+    /// host polling across a seek would otherwise see a 0 it has to distinguish
+    /// from "unknown". A genuine mid-stream rate change overwrites it on the
+    /// next frame, which is the same freshness the `last_*` fields get.
+    decoded_sample_rate: u32,
     coordinate_format: RCoordinateFormat,
 
     // ── per-stream spatial state ──
@@ -260,6 +274,7 @@ impl Engine {
             bridge,
             renderer,
             sample_rate,
+            decoded_sample_rate: 0,
             coordinate_format,
             fixed_planner: virtual_bed::FixedChannelPlanner::new(),
             bed_planner: virtual_bed::BedChannelPlanner::new(),
@@ -657,6 +672,18 @@ impl Engine {
         self.sample_rate
     }
 
+    /// Sampling frequency the bridge actually decoded the last frame at, or 0
+    /// before the first frame (or if the bridge did not report one).
+    ///
+    /// A host that had to name a rate at create time can compare this against
+    /// it and re-open if they differ. Only the decoder knows this: a rate the
+    /// host reads from a container or a sync word is a prediction, and for
+    /// formats that carry a higher-rate extension over a lower-rate core it is
+    /// a wrong one.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.decoded_sample_rate
+    }
+
     /// Reset the session after a seek or stream discontinuity. Flushes the
     /// bridge pipeline and the renderer's per-object/ramp state, and clears the
     /// per-stream spatial state. Live parameters (gains, layout, OSC-applied
@@ -885,6 +912,10 @@ impl Engine {
         let channel_count = frame.channel_count as usize;
         let sample_count = frame.sample_count as usize;
         let sample_rate = frame.sampling_frequency.max(1);
+        // The raw field rather than the clamped local: 0 is the bridge saying it
+        // does not know, and a host has to be able to tell that from a rate.
+        // Clamping it to 1 here would hand the host a number it would act on.
+        self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
 
         let want_osc = self.osc.as_ref().is_some_and(|o| o.has_osc_clients());

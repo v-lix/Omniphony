@@ -24,7 +24,7 @@
 // C-ABI minor version: backwards-compatible additions only. Consumers should
 // gate optional features on symbol presence (dlsym), not on this value; it
 // exists for logging and diagnostics.
-#define ORENDER_ABI_MINOR 7
+#define ORENDER_ABI_MINOR 8
 
 // Speaker-position labels written by [`orender_channel_layout`] and
 // [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -200,6 +200,25 @@ uint32_t orender_channel_count(const struct OrenderRenderer *r);
 // call again. Each byte is an [`OrenderChannelLabel`] value (255 = Unknown).
 // Returns 0 on error/NULL handle.
 uint32_t orender_channel_layout(const struct OrenderRenderer *r, uint8_t *out_labels, uint32_t cap);
+
+// Sampling frequency (Hz) the bridge actually decoded the last frame at, or 0
+// if no frame has been decoded yet, the handle is NULL, or the bridge did not
+// report one.
+//
+// The counterpart to `OrenderConfig::sample_rate`, which is only what the host
+// asked for. A host must name a rate before the first packet exists, so for
+// any format carrying a higher-rate extension over a lower-rate core — DTS XLL
+// at 96 kHz over a 48 kHz core is the standard case — the rate it named from
+// the container or the core sync word is wrong, and the engine renders at one
+// rate while the host labels the output with another. The whole audible
+// symptom is a film playing at the wrong speed for its full length, with
+// nothing downstream in a position to notice.
+//
+// So: create at the host's best guess, feed packets, then read this once a
+// frame has come out and re-open at what it says if it differs. Poll it rather
+// than latching — a stream may genuinely change rate mid-file, and this always
+// answers for the last frame rendered.
+uint32_t orender_decoded_sample_rate(const struct OrenderRenderer *r);
 
 // Reset after a seek/discontinuity (flushes decoder + renderer state, keeps
 // live params).

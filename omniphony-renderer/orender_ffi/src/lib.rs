@@ -202,7 +202,10 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 // 7: added orender_output_latency_samples (constant DSP latency of the
 //    rendered output, for host A/V sync compensation — non-zero when the
 //    linear-phase FIR crossover is active).
-pub const ORENDER_ABI_MINOR: u32 = 7;
+// 8: added orender_decoded_sample_rate (the rate the bridge actually decoded
+//    at, which only the decoder knows — a host that named the wrong rate at
+//    create time can re-open at this one).
+pub const ORENDER_ABI_MINOR: u32 = 8;
 
 /// Speaker-position labels written by [`orender_channel_layout`] and
 /// [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -640,6 +643,34 @@ pub unsafe extern "C" fn orender_channel_layout(
             }
         }
         n
+    }))
+    .unwrap_or(0)
+}
+
+/// Sampling frequency (Hz) the bridge actually decoded the last frame at, or 0
+/// if no frame has been decoded yet, the handle is NULL, or the bridge did not
+/// report one.
+///
+/// The counterpart to `OrenderConfig::sample_rate`, which is only what the host
+/// asked for. A host must name a rate before the first packet exists, so for
+/// any format carrying a higher-rate extension over a lower-rate core — DTS XLL
+/// at 96 kHz over a 48 kHz core is the standard case — the rate it named from
+/// the container or the core sync word is wrong, and the engine renders at one
+/// rate while the host labels the output with another. The whole audible
+/// symptom is a film playing at the wrong speed for its full length, with
+/// nothing downstream in a position to notice.
+///
+/// So: create at the host's best guess, feed packets, then read this once a
+/// frame has come out and re-open at what it says if it differs. Poll it rather
+/// than latching — a stream may genuinely change rate mid-file, and this always
+/// answers for the last frame rendered.
+#[no_mangle]
+pub unsafe extern "C" fn orender_decoded_sample_rate(r: *const OrenderRenderer) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        (*(r as *const Engine)).decoded_sample_rate()
     }))
     .unwrap_or(0)
 }
