@@ -236,10 +236,21 @@ impl MeasuredHrirData {
         if self.sample_rate == target {
             return self;
         }
+        use rayon::prelude::*;
         let from = self.sample_rate;
+        // Across cores because a host waits on this. Every pair is independent -
+        // a windowed-sinc resample and four transforms, no shared state - and
+        // there are 836 of them, so this is the one part of building a set that
+        // parallelises without argument. It matters because the work only
+        // happens off the stored rate: a host opening the engine at 44.1 or
+        // 96 kHz pays the whole of it before the first frame renders, where one
+        // opening at 48 kHz pays none of it (the early return above).
+        //
+        // Indexed, so the order is the one that went in - the parallel collect
+        // preserves it, and `dirs`, `vecs` and `tri` below still index into it.
         let irs = self
             .irs
-            .iter()
+            .par_iter()
             .map(|(l, r)| {
                 (
                     minimum_phase(&resample_ir(l, from, target)),
