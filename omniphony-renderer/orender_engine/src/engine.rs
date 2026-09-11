@@ -1302,13 +1302,11 @@ impl Engine {
         // after), so the bed labels are the first `num_beds` channel labels —
         // NOT `channel_labels[bed_id]` (`bed_indices` are OAMD bed ids, a
         // different space). Reuse the buffer.
+        // Also exported for a bed that places height channels and carries no
+        // objects at all - see `exported_bed`.
         self.last_bed_labels.clear();
-        if self.has_objects {
-            for ch in 0..num_beds {
-                if let Some(&lbl) = frame.channel_labels.get(ch) {
-                    self.last_bed_labels.push(lbl);
-                }
-            }
+        if let Some(bed) = exported_bed(self.has_objects, num_beds, &frame.channel_labels) {
+            self.last_bed_labels.extend_from_slice(bed);
         }
 
         if let Some(perf) = self.perf.as_mut() {
@@ -1433,4 +1431,100 @@ fn overlay_positions(objects: &[ObjectMeta]) -> Vec<(u32, f64, f64, f64, String)
             (idx as u32, x, y, z, o.name.clone())
         })
         .collect()
+}
+
+/// True for the eight positions the engine names above the listener.
+fn is_height_label(label: RChannelLabel) -> bool {
+    matches!(
+        label,
+        RChannelLabel::Tfl
+            | RChannelLabel::Tfr
+            | RChannelLabel::Tsl
+            | RChannelLabel::Tsr
+            | RChannelLabel::Tbl
+            | RChannelLabel::Tbr
+            | RChannelLabel::Tfc
+            | RChannelLabel::Tc
+    )
+}
+
+/// The bed the host should be told about, or `None` when there is nothing
+/// worth naming.
+///
+/// An object stream's bed is the fixed prefix the planner laid out, and is
+/// always worth naming: it is the other half of "LFE + 15 Objects".
+///
+/// A stream with no objects is only worth naming when it places height
+/// channels, which makes it a DTS:X presentation - a floor, a fixed height
+/// quartet above it, and nothing on top - rather than plain multichannel. The
+/// host has no other way to tell that apart from a 5.1 track, and "nothing" is
+/// the wrong thing to say about twelve placed channels.
+///
+/// `num_beds` cannot measure that second bed. It counts the fixed prefix the
+/// object path plans, and a frame carrying no object metadata never reaches
+/// that planner, so on exactly the presentations this exists for it is zero.
+/// Where there are no objects every decoded channel is a bed channel, which is
+/// the whole label list.
+fn exported_bed(
+    has_objects: bool,
+    num_beds: usize,
+    labels: &[RChannelLabel],
+) -> Option<&[RChannelLabel]> {
+    let bed_len = if has_objects {
+        num_beds.min(labels.len())
+    } else {
+        labels.len()
+    };
+    let bed = &labels[..bed_len];
+    (has_objects || bed.iter().copied().any(is_height_label)).then_some(bed)
+}
+
+#[cfg(test)]
+mod exported_bed_tests {
+    use super::*;
+    use RChannelLabel as L;
+
+    const FLOOR_5_1: [L; 6] = [L::L, L::R, L::C, L::LFE, L::Ls, L::Rs];
+
+    #[test]
+    fn an_object_stream_exports_its_planned_fixed_prefix() {
+        // Beds first, objects after; only the prefix is the bed.
+        let labels = [L::LFE, L::Object, L::Object, L::Object];
+        assert_eq!(exported_bed(true, 1, &labels), Some(&labels[..1]));
+    }
+
+    #[test]
+    fn plain_multichannel_exports_nothing() {
+        // No objects and nothing overhead: the host should say nothing, which
+        // is what it did before any of this and must keep doing.
+        assert_eq!(exported_bed(false, 0, &FLOOR_5_1), None);
+        assert_eq!(exported_bed(false, 0, &[]), None);
+    }
+
+    /// The bug this function exists to prevent: a DTS:X presentation places a
+    /// floor and a height quartet and carries no objects, so the object path
+    /// never plans a fixed prefix and `num_beds` arrives as zero. Measuring the
+    /// bed by that number found no heights and exported nothing, which is how
+    /// a 7.1.4 presentation came to show an empty row.
+    #[test]
+    fn a_height_bed_without_objects_is_exported_even_when_num_beds_is_zero() {
+        let labels = [
+            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Lb, L::Rb, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+        ];
+        assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
+    }
+
+    #[test]
+    fn the_imax_height_set_counts_too() {
+        // The five-feed profile adds a top-front-centre to the quartet.
+        let labels = [
+            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Tfc, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+        ];
+        assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
+    }
+
+    #[test]
+    fn a_bed_longer_than_the_labels_cannot_overrun() {
+        assert_eq!(exported_bed(true, 99, &FLOOR_5_1), Some(&FLOOR_5_1[..]));
+    }
 }
