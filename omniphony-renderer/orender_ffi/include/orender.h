@@ -24,7 +24,7 @@
 // C-ABI minor version: backwards-compatible additions only. Consumers should
 // gate optional features on symbol presence (dlsym), not on this value; it
 // exists for logging and diagnostics.
-#define ORENDER_ABI_MINOR 9
+#define ORENDER_ABI_MINOR 10
 
 // Speaker-position labels written by [`orender_channel_layout`] and
 // [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -224,6 +224,13 @@ uint32_t orender_channel_count(const struct OrenderRenderer *r);
 // call again. Each byte is an [`OrenderChannelLabel`] value (255 = Unknown).
 // Returns 0 on error/NULL handle.
 uint32_t orender_channel_layout(const struct OrenderRenderer *r, uint8_t *out_labels, uint32_t cap);
+
+// Sampling frequency (Hz) of the last decoded frame, or 0 before a rate is
+// reported and on a NULL handle / error. Retained across same-stream seeks.
+// This is distinct from the configured renderer rate: an extension such as
+// DTS XLL can decode at 96 kHz over a 48 kHz core. Poll after processing and
+// reopen at this rate if needed, before playing mismatched-rate output.
+uint32_t orender_decoded_sample_rate(const struct OrenderRenderer *r);
 
 // Reset after a seek/discontinuity (flushes decoder + renderer state, keeps
 // live params).

@@ -58,6 +58,10 @@ pub struct Engine {
     bridge: LoadedBridge,
     renderer: SpatialRenderer,
     sample_rate: u32,
+    /// Rate of the last decoded frame, or zero before the bridge reports one.
+    /// Retained across a same-stream seek; a new frame replaces it. This can
+    /// differ from the session rate when a codec has a higher-rate extension.
+    decoded_sample_rate: u32,
     coordinate_format: RCoordinateFormat,
 
     // ── per-stream spatial state ──
@@ -274,6 +278,7 @@ impl Engine {
             bridge,
             renderer,
             sample_rate,
+            decoded_sample_rate: 0,
             coordinate_format,
             fixed_planner: virtual_bed::FixedChannelPlanner::new(),
             bed_planner: virtual_bed::BedChannelPlanner::new(),
@@ -683,6 +688,13 @@ impl Engine {
         self.sample_rate
     }
 
+    /// Last decoder output rate in Hz, not the configured renderer rate.
+    /// Zero means no rate has been reported. The host can use a mismatch to
+    /// reopen the renderer at the decoded rate before playing its output.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.decoded_sample_rate
+    }
+
     /// Reset the session after a seek or stream discontinuity. Flushes the
     /// bridge pipeline and the renderer's per-object/ramp state, and clears the
     /// per-stream spatial state. Live parameters (gains, layout, OSC-applied
@@ -937,6 +949,9 @@ impl Engine {
         let channel_count = frame.channel_count as usize;
         let sample_count = frame.sample_count as usize;
         let sample_rate = frame.sampling_frequency.max(1);
+        // Keep zero distinguishable from a reported rate; the clamped local
+        // above is only for calculations that must not divide by zero.
+        self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
 
         let want_osc = self.osc.as_ref().is_some_and(|o| o.has_osc_clients());

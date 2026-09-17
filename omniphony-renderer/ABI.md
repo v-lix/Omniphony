@@ -63,3 +63,15 @@ not know that key" — treat it as feature-unavailable, not as an error.
 3. If breaking: expect the soname to change; update packaging (`PKGBUILD`
    symlinks) and warn mpv-omniphony (bundled lib name changes).
 4. `cargo test -p orender_ffi` + run `examples/smoke.c` (CI does both).
+
+## Kodi fork additions (C ABI 0.10)
+
+Upstream ABI 8 height-tier labels and ABI 9 `orender_source_label` retain
+their values and contracts. This fork adds `orender_decoded_sample_rate`:
+the last decoder output rate in Hz, zero before it is reported or for a NULL
+handle. It survives a same-stream seek and updates with each decoded frame;
+it is not the configured renderer rate. Hosts poll it to detect when the
+renderer must be reopened at the source rate. Probe the symbol, not minor 10.
+
+The Rust plugin interface remains `bridge_api` 0.4; its package version is
+independent of the C ABI minor. Rebuild the matching renderer and plugins.
