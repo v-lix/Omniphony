@@ -30,6 +30,9 @@ int main(void) {
         return 7;
     }
 
+    if (orender_decoded_sample_rate(NULL) != 0) { puts("FAIL: decoded rate for NULL"); return 10; }
+    if (orender_hrir_in_use(NULL, NULL, 0) != 0) { puts("FAIL: HRIR set for NULL"); return 13; }
+
     /* Build id is static and never NULL. */
     const char *build_id = orender_build_id();
     if (build_id == NULL) { printf("FAIL: orender_build_id() == NULL\n"); return 8; }

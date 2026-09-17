@@ -1,4 +1,4 @@
-//! Exercise EOF across the C entry points with a decoder
+//! Exercise rate reporting and EOF across the C entry points with a decoder
 //! that holds one access unit. No codec corpus, filesystem config or OSC port.
 use std::os::raw::c_int;
 use std::ptr;
@@ -7,7 +7,8 @@ use abi_stable::std_types::{ROption, RSlice, RStr, RString, RVec};
 use abi_stable::{prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque};
 use bridge_api::*;
 use orender::{
-    OrenderRenderer, orender_channel_count, orender_drain, orender_process, orender_reset,
+    OrenderRenderer, orender_channel_count, orender_decoded_sample_rate, orender_drain,
+    orender_hrir_in_use, orender_process, orender_reset,
 };
 use orender_engine::Engine;
 use orender_engine::bridge_loader::{BridgeLibs, LoadedBridge};
@@ -169,8 +170,11 @@ fn drain_retries_keep_audio_and_timestamps_without_decoding_twice() {
     let r = (&mut *engine as *mut Engine).cast::<OrenderRenderer>();
     unsafe {
         let expected_channels = orender_channel_count(r);
+        assert_eq!(orender_decoded_sample_rate(r), 0);
         assert_eq!(feed(r, 96), (0, 0));
+        assert_eq!(orender_decoded_sample_rate(r), 0);
         assert_eq!(feed(r, 48), (0, 4));
+        assert_eq!(orender_decoded_sample_rate(r), 96_000);
         let mut out = [f32::NAN; 64];
         let mut frames = usize::MAX;
         let mut channels = 0;
@@ -183,6 +187,7 @@ fn drain_retries_keep_audio_and_timestamps_without_decoding_twice() {
             assert_eq!(frames, 0);
             assert!(out.iter().all(|s| s.is_nan()));
         }
+        assert_eq!(orender_decoded_sample_rate(r), 48_000);
         assert!(
             feed(r, 48).0 < 0,
             "pending tail must not be overtaken by input"
@@ -242,6 +247,11 @@ fn reset_discards_pending_tail_and_drain_reports_decoder_errors() {
         );
         orender_reset(r);
         assert_eq!(
+            orender_decoded_sample_rate(r),
+            96_000,
+            "same-stream seek retains the last known rate"
+        );
+        assert_eq!(
             orender_drain(
                 r,
                 out.as_mut_ptr(),
@@ -278,5 +288,26 @@ fn reset_discards_pending_tail_and_drain_reports_decoder_errors() {
             ),
             -2
         );
+    }
+}
+
+#[test]
+fn hrir_in_use_names_the_convolved_set_with_the_label_convention() {
+    let mut engine = engine();
+    let r = (&mut *engine as *mut Engine).cast::<OrenderRenderer>();
+    unsafe {
+        assert_eq!(orender_hrir_in_use(ptr::null(), ptr::null_mut(), 0), 0);
+
+        // Nothing configured: the embedded KEMAR set the engine starts with.
+        let n = orender_hrir_in_use(r, ptr::null_mut(), 0);
+        assert_eq!(n, 3);
+
+        // cap == N writes nothing; cap > N writes the name and its NUL.
+        let mut buf = [0x7f as std::os::raw::c_char; 8];
+        assert_eq!(orender_hrir_in_use(r, buf.as_mut_ptr(), n), n);
+        assert!(buf.iter().all(|&c| c == 0x7f));
+        assert_eq!(orender_hrir_in_use(r, buf.as_mut_ptr(), n + 1), n);
+        let name = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+        assert_eq!(name, "saf");
     }
 }

@@ -107,7 +107,21 @@ been collected. `orender_reset` discards it.
 
 ## Fork additions (C ABI 0.13)
 
-Upstream ABI 8 to 12 entry points retain their values and contracts.
+Upstream ABI 8 to 12 entry points retain their values and contracts. This
+fork adds `orender_decoded_sample_rate`: the last decoder output rate in Hz,
+zero before it is reported or for a NULL handle. It survives a same-stream
+seek and updates with each decoded frame; it is not the session rate the host
+configured. The renderer follows the stream's rate, so this is the rate the
+audio comes back at: hosts poll it to detect when they must reopen at the
+source rate. Probe the symbol, not minor 13.
+
+`orender_hrir_in_use` names the HRIR set the binaural path is convolving
+with, using the `hrir_source` selectors (`saf`, `sofa`, `brir`, ...), with the
+`orender_source_label` query/fill convention. It reports the set in use, not
+the one configured: a SOFA file that failed to load reads as `saf`. A
+configured set is requested with the first rendered block and built off the
+audio thread, so the answer is live and can change shortly after a stream
+starts.
 
 The Rust plugin interface is `bridge_api` 0.7, one minor past upstream's 0.6
 for the method described below; its package version is independent of the C
