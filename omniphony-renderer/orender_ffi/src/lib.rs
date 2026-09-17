@@ -219,7 +219,9 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     option — config.yaml, Studio, OSC — switching at packet boundaries) and
 //     orender_output_packet_pts (the host timestamp of the packet whose audio
 //     the last call returned); orender_process now reads its pts_us argument.
-pub const ORENDER_ABI_MINOR: u32 = 11;
+// 12: fork addition orender_decoded_sample_rate, the bridge's actual output
+//     rate so a host can detect a mismatch with its configured session rate.
+pub const ORENDER_ABI_MINOR: u32 = 12;
 
 /// Speaker-position labels written by [`orender_channel_layout`] and
 /// [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -701,6 +703,22 @@ pub unsafe extern "C" fn orender_channel_layout(
             }
         }
         n
+    }))
+    .unwrap_or(0)
+}
+
+/// Sampling frequency (Hz) of the last decoded frame, or 0 before a rate is
+/// reported and on a NULL handle / error. Retained across same-stream seeks.
+/// This is distinct from the configured renderer rate: an extension such as
+/// DTS XLL can decode at 96 kHz over a 48 kHz core. Poll after processing and
+/// reopen at this rate if needed, before playing mismatched-rate output.
+#[no_mangle]
+pub unsafe extern "C" fn orender_decoded_sample_rate(r: *const OrenderRenderer) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        (*(r as *const Engine)).decoded_sample_rate()
     }))
     .unwrap_or(0)
 }
