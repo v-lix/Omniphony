@@ -57,6 +57,20 @@ pub struct Engine {
     bridge: LoadedBridge,
     renderer: SpatialRenderer,
     sample_rate: u32,
+    /// Sampling frequency of the last frame the bridge actually decoded, or 0
+    /// before the first one. The counterpart to `sample_rate`, which is only
+    /// what the host *asked* for: the two agree for every format whose rate the
+    /// host can read ahead of decoding, and disagree wherever it cannot - a DTS
+    /// XLL extension over a 48 kHz core decodes at 96 kHz while the core sync
+    /// word the host parsed says 48.
+    ///
+    /// Deliberately not cleared by [`Engine::reset`] or on a segment boundary,
+    /// unlike the `last_*` fields below. Those describe one frame's content, so
+    /// a stale value would be a wrong answer; this describes the stream, and a
+    /// host polling across a seek would otherwise see a 0 it has to distinguish
+    /// from "unknown". A genuine mid-stream rate change overwrites it on the
+    /// next frame, which is the same freshness the `last_*` fields get.
+    decoded_sample_rate: u32,
     coordinate_format: RCoordinateFormat,
 
     // ── per-stream spatial state ──
@@ -260,6 +274,7 @@ impl Engine {
             bridge,
             renderer,
             sample_rate,
+            decoded_sample_rate: 0,
             coordinate_format,
             fixed_planner: virtual_bed::FixedChannelPlanner::new(),
             bed_planner: virtual_bed::BedChannelPlanner::new(),
@@ -563,6 +578,15 @@ impl Engine {
         self.bridge.bridge.has_objects()
     }
 
+    /// What the stream presents itself as when its container does not say it -
+    /// "Auro 11.1" for an Auro-Codec carrier - and empty for every stream whose
+    /// name the host already has. Asked of the bridge rather than cached, for
+    /// the same reason `has_objects` is: it is a live fact about the stream and
+    /// latching it here would outlive the presentation it describes.
+    pub fn presentation_name(&self) -> String {
+        self.bridge.bridge.presentation_name().into_string()
+    }
+
     /// Dynamic object count of the last rendered frame (decoded `channel_count`
     /// minus the bed channels), or `0` for plain multichannel content. For the
     /// host's track info display.
@@ -655,6 +679,18 @@ impl Engine {
     /// Input sample rate the session was created for.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Sampling frequency the bridge actually decoded the last frame at, or 0
+    /// before the first frame (or if the bridge did not report one).
+    ///
+    /// A host that had to name a rate at create time can compare this against
+    /// it and re-open if they differ. Only the decoder knows this: a rate the
+    /// host reads from a container or a sync word is a prediction, and for
+    /// formats that carry a higher-rate extension over a lower-rate core it is
+    /// a wrong one.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.decoded_sample_rate
     }
 
     /// Reset the session after a seek or stream discontinuity. Flushes the
@@ -885,6 +921,10 @@ impl Engine {
         let channel_count = frame.channel_count as usize;
         let sample_count = frame.sample_count as usize;
         let sample_rate = frame.sampling_frequency.max(1);
+        // The raw field rather than the clamped local: 0 is the bridge saying it
+        // does not know, and a host has to be able to tell that from a rate.
+        // Clamping it to 1 here would hand the host a number it would act on.
+        self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
 
         let want_osc = self.osc.as_ref().is_some_and(|o| o.has_osc_clients());
@@ -1302,13 +1342,11 @@ impl Engine {
         // after), so the bed labels are the first `num_beds` channel labels —
         // NOT `channel_labels[bed_id]` (`bed_indices` are OAMD bed ids, a
         // different space). Reuse the buffer.
+        // Also exported for a bed that places height channels and carries no
+        // objects at all - see `exported_bed`.
         self.last_bed_labels.clear();
-        if self.has_objects {
-            for ch in 0..num_beds {
-                if let Some(&lbl) = frame.channel_labels.get(ch) {
-                    self.last_bed_labels.push(lbl);
-                }
-            }
+        if let Some(bed) = exported_bed(self.has_objects, num_beds, &frame.channel_labels) {
+            self.last_bed_labels.extend_from_slice(bed);
         }
 
         if let Some(perf) = self.perf.as_mut() {
@@ -1433,4 +1471,100 @@ fn overlay_positions(objects: &[ObjectMeta]) -> Vec<(u32, f64, f64, f64, String)
             (idx as u32, x, y, z, o.name.clone())
         })
         .collect()
+}
+
+/// True for the eight positions the engine names above the listener.
+fn is_height_label(label: RChannelLabel) -> bool {
+    matches!(
+        label,
+        RChannelLabel::Tfl
+            | RChannelLabel::Tfr
+            | RChannelLabel::Tsl
+            | RChannelLabel::Tsr
+            | RChannelLabel::Tbl
+            | RChannelLabel::Tbr
+            | RChannelLabel::Tfc
+            | RChannelLabel::Tc
+    )
+}
+
+/// The bed the host should be told about, or `None` when there is nothing
+/// worth naming.
+///
+/// An object stream's bed is the fixed prefix the planner laid out, and is
+/// always worth naming: it is the other half of "LFE + 15 Objects".
+///
+/// A stream with no objects is only worth naming when it places height
+/// channels, which makes it a DTS:X presentation - a floor, a fixed height
+/// quartet above it, and nothing on top - rather than plain multichannel. The
+/// host has no other way to tell that apart from a 5.1 track, and "nothing" is
+/// the wrong thing to say about twelve placed channels.
+///
+/// `num_beds` cannot measure that second bed. It counts the fixed prefix the
+/// object path plans, and a frame carrying no object metadata never reaches
+/// that planner, so on exactly the presentations this exists for it is zero.
+/// Where there are no objects every decoded channel is a bed channel, which is
+/// the whole label list.
+fn exported_bed(
+    has_objects: bool,
+    num_beds: usize,
+    labels: &[RChannelLabel],
+) -> Option<&[RChannelLabel]> {
+    let bed_len = if has_objects {
+        num_beds.min(labels.len())
+    } else {
+        labels.len()
+    };
+    let bed = &labels[..bed_len];
+    (has_objects || bed.iter().copied().any(is_height_label)).then_some(bed)
+}
+
+#[cfg(test)]
+mod exported_bed_tests {
+    use super::*;
+    use RChannelLabel as L;
+
+    const FLOOR_5_1: [L; 6] = [L::L, L::R, L::C, L::LFE, L::Ls, L::Rs];
+
+    #[test]
+    fn an_object_stream_exports_its_planned_fixed_prefix() {
+        // Beds first, objects after; only the prefix is the bed.
+        let labels = [L::LFE, L::Object, L::Object, L::Object];
+        assert_eq!(exported_bed(true, 1, &labels), Some(&labels[..1]));
+    }
+
+    #[test]
+    fn plain_multichannel_exports_nothing() {
+        // No objects and nothing overhead: the host should say nothing, which
+        // is what it did before any of this and must keep doing.
+        assert_eq!(exported_bed(false, 0, &FLOOR_5_1), None);
+        assert_eq!(exported_bed(false, 0, &[]), None);
+    }
+
+    /// The bug this function exists to prevent: a DTS:X presentation places a
+    /// floor and a height quartet and carries no objects, so the object path
+    /// never plans a fixed prefix and `num_beds` arrives as zero. Measuring the
+    /// bed by that number found no heights and exported nothing, which is how
+    /// a 7.1.4 presentation came to show an empty row.
+    #[test]
+    fn a_height_bed_without_objects_is_exported_even_when_num_beds_is_zero() {
+        let labels = [
+            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Lb, L::Rb, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+        ];
+        assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
+    }
+
+    #[test]
+    fn the_imax_height_set_counts_too() {
+        // The five-feed profile adds a top-front-centre to the quartet.
+        let labels = [
+            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Tfc, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+        ];
+        assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
+    }
+
+    #[test]
+    fn a_bed_longer_than_the_labels_cannot_overrun() {
+        assert_eq!(exported_bed(true, 99, &FLOOR_5_1), Some(&FLOOR_5_1[..]));
+    }
 }

@@ -277,6 +277,11 @@ impl FormatBridge for WavBridge {
     fn set_drc_mode(&mut self, _mode: RStr<'_>) -> bool {
         false
     }
+
+    /// Nothing to add: a WAV names its own layout in its header.
+    fn presentation_name(&self) -> RString {
+        RString::new()
+    }
 }
 
 #[cfg(test)]

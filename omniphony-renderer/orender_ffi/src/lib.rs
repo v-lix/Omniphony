@@ -202,7 +202,18 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 // 7: added orender_output_latency_samples (constant DSP latency of the
 //    rendered output, for host A/V sync compensation — non-zero when the
 //    linear-phase FIR crossover is active).
-pub const ORENDER_ABI_MINOR: u32 = 7;
+// 8: this fork's symbols, which upstream's 7 does not carry. Both answer a
+//    question only the decoder can, and both are probed rather than required,
+//    so they share the one number instead of taking one each: the minor is a
+//    diagnostic counter and a host that reads it to decide anything is already
+//    doing the wrong thing (see ABI.md - gate on symbol presence).
+//    - orender_decoded_sample_rate: the rate the bridge actually decoded at,
+//      so a host that named the wrong rate at create time can re-open at this
+//      one.
+//    - orender_presentation_name: what the stream presents itself as when its
+//      container does not name it — an Auro-Codec carrier is an ordinary
+//      DTS-HD MA track until a decoder reads its side channel.
+pub const ORENDER_ABI_MINOR: u32 = 8;
 
 /// Speaker-position labels written by [`orender_channel_layout`] and
 /// [`orender_bed_layout`] (one byte per channel). Mirrors the engine's
@@ -524,6 +535,39 @@ pub unsafe extern "C" fn orender_bed_layout(
     .unwrap_or(0)
 }
 
+/// What the stream presents itself as when its container does not name it -
+/// `"Auro 11.1"` for an Auro-Codec carrier - so the host can say so.
+///
+/// Empty (returns `0`) for every stream whose name the host already has from
+/// the container: Atmos, DTS:X and plain multichannel all report nothing here
+/// rather than a second opinion for the host to reconcile.
+///
+/// Same query/fill convention as [`orender_bed_layout`]: returns the byte
+/// length `N` of the name, not counting a terminator; if `out` is non-NULL and
+/// `cap >= N` the first `N` bytes are written (no NUL - the caller has the
+/// length). Call with `out = NULL` to query `N`. `0` for no name, a NULL
+/// handle, or an error.
+#[no_mangle]
+pub unsafe extern "C" fn orender_presentation_name(
+    r: *const OrenderRenderer,
+    out: *mut u8,
+    cap: u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        let name = (*(r as *const Engine)).presentation_name();
+        let bytes = name.as_bytes();
+        let n = bytes.len() as u32;
+        if !out.is_null() && cap >= n {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        }
+        n
+    }))
+    .unwrap_or(0)
+}
+
 /// Constant DSP latency of the rendered output, in samples at the engine
 /// sample rate: PCM fed to [`orender_process`] emerges this many samples later
 /// in the rendered stream. 0 for the default filters; non-zero when the
@@ -640,6 +684,34 @@ pub unsafe extern "C" fn orender_channel_layout(
             }
         }
         n
+    }))
+    .unwrap_or(0)
+}
+
+/// Sampling frequency (Hz) the bridge actually decoded the last frame at, or 0
+/// if no frame has been decoded yet, the handle is NULL, or the bridge did not
+/// report one.
+///
+/// The counterpart to `OrenderConfig::sample_rate`, which is only what the host
+/// asked for. A host must name a rate before the first packet exists, so for
+/// any format carrying a higher-rate extension over a lower-rate core — DTS XLL
+/// at 96 kHz over a 48 kHz core is the standard case — the rate it named from
+/// the container or the core sync word is wrong, and the engine renders at one
+/// rate while the host labels the output with another. The whole audible
+/// symptom is a film playing at the wrong speed for its full length, with
+/// nothing downstream in a position to notice.
+///
+/// So: create at the host's best guess, feed packets, then read this once a
+/// frame has come out and re-open at what it says if it differs. Poll it rather
+/// than latching — a stream may genuinely change rate mid-file, and this always
+/// answers for the last frame rendered.
+#[no_mangle]
+pub unsafe extern "C" fn orender_decoded_sample_rate(r: *const OrenderRenderer) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        (*(r as *const Engine)).decoded_sample_rate()
     }))
     .unwrap_or(0)
 }
