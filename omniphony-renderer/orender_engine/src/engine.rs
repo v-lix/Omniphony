@@ -113,6 +113,10 @@ pub struct Engine {
     carried_declaration: Option<Declaration>,
     renderer: SpatialRenderer,
     sample_rate: u32,
+    /// Rate of the last decoded frame, or zero before the bridge reports one.
+    /// Retained across a same-stream seek; a new frame replaces it. This can
+    /// differ from the session rate when a codec has a higher-rate extension.
+    decoded_sample_rate: u32,
 
     /// The per-stream state and its rules, shared with the CLI host (see
     /// [`crate::stream_state`]). Its declaration comes from the last
@@ -302,6 +306,7 @@ impl Engine {
             carried_declaration: None,
             renderer,
             sample_rate,
+            decoded_sample_rate: 0,
             stream: StreamState::new(coordinate_format),
             decoded_samples: 0,
             last_object_count: 0,
@@ -696,6 +701,14 @@ impl Engine {
     /// Input sample rate the session was created for.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Last decoder output rate in Hz, not the session rate the host
+    /// configured; the renderer follows it, so it is the rate of the audio
+    /// returned. Zero means no rate has been reported. The host can use a
+    /// mismatch to reopen at the decoded rate before playing its output.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.decoded_sample_rate
     }
 
     /// Reset the session after a seek or stream discontinuity. Flushes the
@@ -1194,6 +1207,9 @@ impl Engine {
         let channel_count = frame.channel_count as usize;
         let sample_count = frame.sample_count as usize;
         let sample_rate = frame.sampling_frequency.max(1);
+        // Keep zero distinguishable from a reported rate; the clamped local
+        // above is only for calculations that must not divide by zero.
+        self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
         render::follow_stream_rate(&mut self.renderer, frame.sampling_frequency)?;
 
