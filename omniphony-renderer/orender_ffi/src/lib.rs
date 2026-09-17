@@ -222,8 +222,10 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     the last call returned); orender_process now reads its pts_us argument.
 // 12: added the `heard_us` key of orender_set_option (where the listener is,
 //     relayed to OSC clients as /omniphony/playout/heard).
-// 13: fork addition orender_drain releasing a pending decoder access unit
-//     at EOF too.
+// 13: fork additions: orender_decoded_sample_rate, the bridge's actual output
+//     rate so a host can detect a mismatch with its configured session rate;
+//     orender_drain releasing a pending decoder access unit at EOF too; and
+//     orender_hrir_in_use to name the HRIR set the binaural path convolves.
 pub const ORENDER_ABI_MINOR: u32 = 13;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -621,6 +623,44 @@ pub unsafe extern "C" fn orender_source_label(
     .unwrap_or(0)
 }
 
+/// Write the selector of the HRIR set the binaural renderer is convolving
+/// with — `saf` (the embedded KEMAR set), `sofa`, `brir`, `synthetic`,
+/// `pinna` or `prtf`, the same words `hrir_source` takes in the config — as a
+/// NUL-terminated string. It names the set in use, not the one configured: a
+/// SOFA file that could not be loaded reports `saf`, the set the build fell
+/// back to. Live: a configured set is requested with the first rendered block
+/// and built off the audio thread, so the answer can move from `saf` to
+/// `sofa` a moment into the stream; poll it with the other per-frame queries
+/// rather than latching the first value.
+///
+/// Query/fill convention as `orender_source_label`: returns the length `N`
+/// without the terminator and writes only when `out` is non-NULL and
+/// `cap > N`. 0 on a NULL handle / error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_hrir_in_use(
+    r: *const OrenderRenderer,
+    out: *mut c_char,
+    cap: u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        let status = unsafe { &*(r as *const Engine) }.hrir_status();
+        let name = status.effective.as_str().as_bytes();
+        let n = name.len() as u32;
+        if !out.is_null() && cap > n {
+            // SAFETY: non-null, and the caller's buffer holds `cap > n` bytes.
+            let out = unsafe { std::slice::from_raw_parts_mut(out as *mut u8, name.len() + 1) };
+            out[..name.len()].copy_from_slice(name);
+            out[name.len()] = 0;
+        }
+        n
+    }))
+    .unwrap_or(0)
+}
+
 /// Constant DSP latency of the rendered output, in samples at the engine
 /// sample rate: PCM fed to `orender_process` emerges this many samples later
 /// in the rendered stream. 0 for the default filters; non-zero when the
@@ -745,6 +785,25 @@ pub unsafe extern "C" fn orender_channel_layout(
             }
         }
         n
+    }))
+    .unwrap_or(0)
+}
+
+/// Sampling frequency (Hz) of the last decoded frame, or 0 before a rate is
+/// reported and on a NULL handle / error. Retained across same-stream seeks.
+/// This is distinct from the session rate the host configured: an extension
+/// such as DTS XLL can decode at 96 kHz over a 48 kHz core, and the renderer
+/// follows the stream's rate, so the audio comes back at this one. Poll after
+/// processing and reopen at this rate if needed, before playing mismatched-rate
+/// output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_decoded_sample_rate(r: *const OrenderRenderer) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        unsafe { &*(r as *const Engine) }.decoded_sample_rate()
     }))
     .unwrap_or(0)
 }

@@ -115,6 +115,10 @@ pub struct Engine {
     carried_declaration: Option<Declaration>,
     renderer: SpatialRenderer,
     sample_rate: u32,
+    /// Rate of the last decoded frame, or zero before the bridge reports one.
+    /// Retained across a same-stream seek; a new frame replaces it. This can
+    /// differ from the session rate when a codec has a higher-rate extension.
+    decoded_sample_rate: u32,
 
     /// The per-frame sequence, shared with the CLI host (see
     /// [`crate::frame_pipeline`]), and the per-stream state it keeps. The
@@ -304,6 +308,7 @@ impl Engine {
             carried_declaration: None,
             renderer,
             sample_rate,
+            decoded_sample_rate: 0,
             pipeline: FramePipeline::new(coordinate_format),
             decoded_samples: 0,
             last_object_count: 0,
@@ -755,6 +760,22 @@ impl Engine {
         if let Some(osc) = self.osc.as_mut() {
             osc.send_heard(u64::try_from(pos).unwrap_or(u64::MAX), rate);
         }
+    }
+
+    /// Last decoder output rate in Hz, not the session rate the host
+    /// configured; the renderer follows it, so it is the rate of the audio
+    /// returned. Zero means no rate has been reported. The host can use a
+    /// mismatch to reopen at the decoded rate before playing its output.
+    pub fn decoded_sample_rate(&self) -> u32 {
+        self.decoded_sample_rate
+    }
+
+    /// The binaural HRIR build status: the set asked for, the set the grid
+    /// actually holds, and why they differ when a SOFA file failed to load.
+    /// Follows the rebuild worker, so it moves from the initial KEMAR set to a
+    /// configured one once that build lands (after the first rendered block).
+    pub fn hrir_status(&self) -> std::sync::Arc<renderer::binaural::HrirStatus> {
+        self.renderer.renderer_control().binaural_hrir_status()
     }
 
     /// Reset the session after a seek or stream discontinuity. Flushes the
@@ -1299,6 +1320,8 @@ impl Engine {
     ) -> Result<Option<RenderedAudio>> {
         let channel_count = frame.channel_count as usize;
         let sample_count = frame.sample_count as usize;
+        // Zero stays distinguishable from a reported rate: it is never clamped.
+        self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
 
         // A mid-stream format change (the initial TrueHD layout settling, or a
