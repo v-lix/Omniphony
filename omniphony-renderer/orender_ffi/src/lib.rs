@@ -213,6 +213,9 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //    - orender_presentation_name: what the stream presents itself as when its
 //      container does not name it — an Auro-Codec carrier is an ordinary
 //      DTS-HD MA track until a decoder reads its side channel.
+//    - the AuroL..AuroT OrenderChannelLabel values, for the speakers Auro-3D
+//      places itself. Appended, so a host that does not know them reads them
+//      as the unknown bytes they are; nothing existing moved.
 pub const ORENDER_ABI_MINOR: u32 = 8;
 
 /// Speaker-position labels written by [`orender_channel_layout`] and
@@ -248,6 +251,24 @@ pub enum OrenderChannelLabel {
     Lfe2 = 23,
     /// The channel carries dynamic-object audio (position driven by metadata).
     Object = 24,
+    /// Auro-3D's speakers. Auro states an exact angle for each and asks for
+    /// them equidistant from the listener, so they are placed from its own
+    /// table rather than at the room corners the labels above describe. The
+    /// LFE and the 12.1 centre surround are not here: no Auro document gives
+    /// either an angle, so they keep `Lfe` and `Cb`.
+    AuroL = 25,
+    AuroR = 26,
+    AuroC = 27,
+    AuroLs = 28,
+    AuroRs = 29,
+    AuroLb = 30,
+    AuroRb = 31,
+    AuroHl = 32,
+    AuroHr = 33,
+    AuroHc = 34,
+    AuroHls = 35,
+    AuroHrs = 36,
+    AuroT = 37,
     Unknown = 255,
 }
 
@@ -1056,6 +1077,19 @@ mod tests {
             RChannelLabel::Tfc => OrenderChannelLabel::Tfc,
             RChannelLabel::LFE2 => OrenderChannelLabel::Lfe2,
             RChannelLabel::Object => OrenderChannelLabel::Object,
+            RChannelLabel::AuroL => OrenderChannelLabel::AuroL,
+            RChannelLabel::AuroR => OrenderChannelLabel::AuroR,
+            RChannelLabel::AuroC => OrenderChannelLabel::AuroC,
+            RChannelLabel::AuroLs => OrenderChannelLabel::AuroLs,
+            RChannelLabel::AuroRs => OrenderChannelLabel::AuroRs,
+            RChannelLabel::AuroLb => OrenderChannelLabel::AuroLb,
+            RChannelLabel::AuroRb => OrenderChannelLabel::AuroRb,
+            RChannelLabel::AuroHl => OrenderChannelLabel::AuroHl,
+            RChannelLabel::AuroHr => OrenderChannelLabel::AuroHr,
+            RChannelLabel::AuroHc => OrenderChannelLabel::AuroHc,
+            RChannelLabel::AuroHls => OrenderChannelLabel::AuroHls,
+            RChannelLabel::AuroHrs => OrenderChannelLabel::AuroHrs,
+            RChannelLabel::AuroT => OrenderChannelLabel::AuroT,
             RChannelLabel::Unknown => OrenderChannelLabel::Unknown,
         }
     }
@@ -1087,6 +1121,19 @@ mod tests {
             RChannelLabel::Rw,
             RChannelLabel::Tfc,
             RChannelLabel::LFE2,
+            RChannelLabel::AuroL,
+            RChannelLabel::AuroR,
+            RChannelLabel::AuroC,
+            RChannelLabel::AuroLs,
+            RChannelLabel::AuroRs,
+            RChannelLabel::AuroLb,
+            RChannelLabel::AuroRb,
+            RChannelLabel::AuroHl,
+            RChannelLabel::AuroHr,
+            RChannelLabel::AuroHc,
+            RChannelLabel::AuroHls,
+            RChannelLabel::AuroHrs,
+            RChannelLabel::AuroT,
             RChannelLabel::Unknown,
         ];
         for label in all {

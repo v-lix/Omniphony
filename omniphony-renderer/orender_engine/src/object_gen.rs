@@ -295,6 +295,12 @@ pub fn input_has_height(labels: &[RChannelLabel]) -> bool {
                 | RChannelLabel::Tbr
                 | RChannelLabel::Tc
                 | RChannelLabel::Tfc
+                | RChannelLabel::AuroHl
+                | RChannelLabel::AuroHr
+                | RChannelLabel::AuroHc
+                | RChannelLabel::AuroHls
+                | RChannelLabel::AuroHrs
+                | RChannelLabel::AuroT
         )
     })
 }
@@ -360,12 +366,19 @@ pub(crate) fn channel_top_position(
 /// Canonical 3D position of any positionable channel: bed channels on the floor
 /// (`z = 0`, honouring the Side/Back surround placement) and height channels at
 /// the ceiling (`z = 1`, the virtual-bed convention). `None` for LFE/unknown.
+///
+/// Auro's speakers are the exception to both conventions: each is stated as an
+/// angle, so it sits on the unit sphere at that angle instead of at a corner of
+/// the room (`crate::virtual_bed::auro_pose_degrees`).
 pub(crate) fn channel_3d_position(
     label: RChannelLabel,
     use_7_1: bool,
     placement: SurroundPlacement,
 ) -> Option<[f64; 3]> {
     use RChannelLabel::*;
+    if let Some((x, y, z)) = crate::virtual_bed::auro_unit_sphere_position(label) {
+        return Some([x as f64, y as f64, z as f64]);
+    }
     let top = match label {
         Tfl => [-1.0, 1.0, 1.0],
         Tfr => [1.0, 1.0, 1.0],

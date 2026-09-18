@@ -58,6 +58,18 @@ pub fn legacy_bed_id(label: bridge_api::RChannelLabel) -> Option<usize> {
         Label::Rs => Some(5),
         Label::Lb => Some(6),
         Label::Rb => Some(7),
+        // Auro's speakers fill the same slots as their counterparts: the export
+        // order is a fixed 10-slot shape, and an Auro presentation has the same
+        // channels in it whatever the labels call them.
+        Label::AuroL => Some(0),
+        Label::AuroR => Some(1),
+        Label::AuroC => Some(2),
+        Label::AuroLs => Some(4),
+        Label::AuroRs => Some(5),
+        Label::AuroLb => Some(6),
+        Label::AuroRb => Some(7),
+        Label::AuroHl => Some(8),
+        Label::AuroHr => Some(9),
         Label::Tfl => Some(8),
         Label::Tfr => Some(9),
         _ => None,

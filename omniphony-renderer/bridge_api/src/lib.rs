@@ -97,6 +97,47 @@ pub enum RChannelLabel {
     /// The channel carries dynamic-object audio; its position comes from the
     /// metadata events of the object bound to it via `RObjectChannel`.
     Object = 24,
+    /// Auro-3D's speakers, every one of which the format places itself.
+    ///
+    /// Auro is a layout before it is a codec. It states an exact angle for each
+    /// speaker and asks for them "equidistant from the main listening position"
+    /// (AURO-3D Home Theater Setup Guidelines v12, 3.3) - a sphere, where the
+    /// labels above describe corners of a room that stretches with it. The
+    /// height layer is the plainest case, because Auro elevates each height
+    /// speaker over the one beneath it rather than onto a tier of its own, so
+    /// no top label means what `HLs` does; but the floor differs too, and by
+    /// more than rounding: Auro's surrounds sit at ±110°, not at the ±90° of a
+    /// square room.
+    ///
+    /// So Auro's channels carry Auro's labels and are placed from Auro's own
+    /// table, and no other format's geometry moves to accommodate them. Names
+    /// and angles are Table 3, "Normative Speaker Positions", nominal column.
+    ///
+    /// Two channels are deliberately not here, both for want of a position
+    /// rather than for want of a name. The LFE keeps [`Self::LFE`]: Auro gives
+    /// it no angle at all, only advice to try several placements and keep the
+    /// one that measures best (4.3). The centre surround of the older 12.1
+    /// configurations keeps [`Self::Cb`]: the 2011 white paper does define
+    /// that layout - a 6.1 lower layer under a 6.0 height layer, "incl. Center
+    /// Surround Channel" - but states no angle for it, and neither do any of
+    /// Auro's other papers, none of which gives an azimuth for any speaker.
+    /// The public layout table has no id pairing six floor channels with a
+    /// height layer either, so it cannot arise in an Auro presentation.
+    AuroL = 25,
+    AuroR = 26,
+    AuroC = 27,
+    AuroLs = 28,
+    AuroRs = 29,
+    AuroLb = 30,
+    AuroRb = 31,
+    AuroHl = 32,
+    AuroHr = 33,
+    AuroHc = 34,
+    AuroHls = 35,
+    AuroHrs = 36,
+    /// Auro's Top layer, the single overhead speaker its documentation also
+    /// calls the Voice of God.
+    AuroT = 37,
     Unknown = 255,
 }
 

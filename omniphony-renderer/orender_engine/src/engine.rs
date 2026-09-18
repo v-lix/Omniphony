@@ -1473,7 +1473,8 @@ fn overlay_positions(objects: &[ObjectMeta]) -> Vec<(u32, f64, f64, f64, String)
         .collect()
 }
 
-/// True for the eight positions the engine names above the listener.
+/// True for every position the engine names above the listener - the Dolby top
+/// tier and Auro's height layer alike.
 fn is_height_label(label: RChannelLabel) -> bool {
     matches!(
         label,
@@ -1485,6 +1486,12 @@ fn is_height_label(label: RChannelLabel) -> bool {
             | RChannelLabel::Tbr
             | RChannelLabel::Tfc
             | RChannelLabel::Tc
+            | RChannelLabel::AuroHl
+            | RChannelLabel::AuroHr
+            | RChannelLabel::AuroHc
+            | RChannelLabel::AuroHls
+            | RChannelLabel::AuroHrs
+            | RChannelLabel::AuroT
     )
 }
 
@@ -1549,7 +1556,18 @@ mod exported_bed_tests {
     #[test]
     fn a_height_bed_without_objects_is_exported_even_when_num_beds_is_zero() {
         let labels = [
-            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Lb, L::Rb, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+            L::L,
+            L::R,
+            L::C,
+            L::LFE,
+            L::Ls,
+            L::Rs,
+            L::Lb,
+            L::Rb,
+            L::Tfl,
+            L::Tfr,
+            L::Tbl,
+            L::Tbr,
         ];
         assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
     }
@@ -1558,7 +1576,17 @@ mod exported_bed_tests {
     fn the_imax_height_set_counts_too() {
         // The five-feed profile adds a top-front-centre to the quartet.
         let labels = [
-            L::L, L::R, L::C, L::LFE, L::Ls, L::Rs, L::Tfc, L::Tfl, L::Tfr, L::Tbl, L::Tbr,
+            L::L,
+            L::R,
+            L::C,
+            L::LFE,
+            L::Ls,
+            L::Rs,
+            L::Tfc,
+            L::Tfl,
+            L::Tfr,
+            L::Tbl,
+            L::Tbr,
         ];
         assert_eq!(exported_bed(false, 0, &labels), Some(&labels[..]));
     }

@@ -253,8 +253,99 @@ fn label_aliases(label: RChannelLabel, use_7_1: bool) -> Option<&'static [&'stat
         RChannelLabel::Tsr => Some(&["TSR", "Tsr", "TpSR", "TopSideRight", "UpperSideRight"]),
         RChannelLabel::Tc => Some(&["TC", "TpC", "TopCenter", "TopMiddleCenter"]),
         RChannelLabel::Tfc => Some(&["TFC", "Tfc", "TpFC", "TopFrontCenter"]),
+        // Auro's speakers, under qualified names throughout: an unqualified `L`
+        // or `HL` in a layout means the position every other format means, and
+        // Auro's are a different set.
+        RChannelLabel::AuroL => Some(&["AuroL", "AuroLeft"]),
+        RChannelLabel::AuroR => Some(&["AuroR", "AuroRight"]),
+        RChannelLabel::AuroC => Some(&["AuroC", "AuroCenter", "AuroCentre"]),
+        RChannelLabel::AuroLs => Some(&["AuroLs", "AuroLeftSurround"]),
+        RChannelLabel::AuroRs => Some(&["AuroRs", "AuroRightSurround"]),
+        RChannelLabel::AuroLb => Some(&["AuroLb", "AuroLeftBack"]),
+        RChannelLabel::AuroRb => Some(&["AuroRb", "AuroRightBack"]),
+        RChannelLabel::AuroHl => Some(&["AuroHL", "AuroHeightLeft"]),
+        RChannelLabel::AuroHr => Some(&["AuroHR", "AuroHeightRight"]),
+        RChannelLabel::AuroHc => Some(&["AuroHC", "AuroHeightCenter", "AuroHeightCentre"]),
+        RChannelLabel::AuroHls => Some(&["AuroHLs", "AuroHeightLeftSurround"]),
+        RChannelLabel::AuroHrs => Some(&["AuroHRs", "AuroHeightRightSurround"]),
+        RChannelLabel::AuroT => Some(&["AuroT", "AuroTop", "AuroVoG"]),
         _ => None,
     }
+}
+
+/// Auro-3D's normative speaker positions, as azimuth and elevation in degrees.
+///
+/// Transcribed from Table 3 ("Normative Speaker Positions") of the AURO-3D
+/// Home Theater Setup Guidelines v12, 2024-05-16, nominal column. The height
+/// layer carries the azimuth of the lower speaker it sits over - "the speakers
+/// on the Height layer follow the same layout but are elevated at an angle of
+/// 30º" (3.3.1.1) - and the Top speaker is directly overhead. A 7.1-based Auro
+/// layout uses the same table: its lower layer follows ITU-R for 7.1 and its
+/// height layer the 5.1 setup (3.3.1.2), which is these rows.
+///
+/// Angles, not corners, because Auro asks for them: "All speakers should be
+/// equidistant from the main listening position" (3.3). Every other channel in
+/// this file is a corner of the normalized room and moves with the room ratio;
+/// Auro's do not, which is the difference between a sphere and a room.
+///
+/// `None` for every label that is not Auro's - including Auro's own LFE and
+/// centre surround, which keep the shared labels because no Auro document
+/// gives either an angle: 4.3 sends the subwoofer wherever it measures best,
+/// and while the 2011 white paper does define the 12.1 layout (a 6.1 lower
+/// layer under a 6.0 height layer), it states no position for the centre
+/// surround it adds.
+fn auro_pose_degrees(label: RChannelLabel) -> Option<(&'static str, f32, f32)> {
+    Some(match label {
+        RChannelLabel::AuroL => ("AuroL", -30.0, 0.0),
+        RChannelLabel::AuroR => ("AuroR", 30.0, 0.0),
+        RChannelLabel::AuroC => ("AuroC", 0.0, 0.0),
+        RChannelLabel::AuroLs => ("AuroLs", -110.0, 0.0),
+        RChannelLabel::AuroRs => ("AuroRs", 110.0, 0.0),
+        RChannelLabel::AuroLb => ("AuroLb", -150.0, 0.0),
+        RChannelLabel::AuroRb => ("AuroRb", 150.0, 0.0),
+        RChannelLabel::AuroHl => ("AuroHL", -30.0, 30.0),
+        RChannelLabel::AuroHr => ("AuroHR", 30.0, 30.0),
+        RChannelLabel::AuroHc => ("AuroHC", 0.0, 30.0),
+        RChannelLabel::AuroHls => ("AuroHLs", -110.0, 30.0),
+        RChannelLabel::AuroHrs => ("AuroHRs", 110.0, 30.0),
+        RChannelLabel::AuroT => ("AuroT", 0.0, 90.0),
+        _ => return None,
+    })
+}
+
+/// [`auro_pose_degrees`] as a point on the unit sphere: the normalized position
+/// the angle occupies in a room of equal proportions, which is what every
+/// consumer that has no room ratio to hand means by a normalized position.
+///
+/// `None` for every label that is not Auro's.
+pub(crate) fn auro_unit_sphere_position(label: RChannelLabel) -> Option<(f32, f32, f32)> {
+    let (_, azimuth, elevation) = auro_pose_degrees(label)?;
+    Some(renderer::spatial_vbap::spherical_to_adm(
+        azimuth, elevation, 1.0,
+    ))
+}
+
+/// [`auro_pose_degrees`] as a normalized position that renders at those angles
+/// under the room in force: spherical → real ADM → inverse room warp, the same
+/// conversion the polar branch of [`speaker_pose_to_normalized`] does for a
+/// layout entry that states an angle.
+fn auro_virtual_bed_pose(
+    label: RChannelLabel,
+    room_ratio: [f32; 3],
+    room_ratio_rear: f32,
+    room_ratio_lower: f32,
+    room_ratio_center_blend: f32,
+) -> Option<(String, f32, f32, f32)> {
+    let (name, azimuth, elevation) = auro_pose_degrees(label)?;
+    let (sx, sy, sz) = renderer::spatial_vbap::spherical_to_adm(azimuth, elevation, 1.0);
+    let [x, y, z] = inverse_room_scaled_position(
+        [sx, sy, sz],
+        room_ratio,
+        room_ratio_rear,
+        room_ratio_lower,
+        room_ratio_center_blend,
+    );
+    Some((name.to_string(), x, y, z))
 }
 
 /// Last-resort bed pose as a **normalized cartesian** corner position, used only
@@ -294,7 +385,15 @@ fn fallback_virtual_bed_pose(
         RChannelLabel::Tsr => ("TSR", 1.0, 0.0, 1.0),
         RChannelLabel::Tc => ("TC", 0.0, 0.0, 1.0),
         RChannelLabel::Tfc => ("TFC", 0.0, 1.0, 1.0),
-        _ => return None,
+        // Auro's height layer is stated as an angle rather than a corner, so
+        // here it is that angle on the unit sphere - the normalized position it
+        // occupies in a room of equal proportions, which is the room this
+        // catalogue describes.
+        _ => {
+            let (name, _, _) = auro_pose_degrees(label)?;
+            let (x, y, z) = auro_unit_sphere_position(label)?;
+            return Some((name.to_string(), x, y, z));
+        }
     };
     Some((name.to_string(), x, y, z))
 }
@@ -306,12 +405,14 @@ fn fallback_virtual_bed_pose(
 /// deliberately excluded.
 pub fn fixed_channel_catalog_json() -> String {
     use RChannelLabel::{
-        C, Cb, L, LFE, LFE2, Lb, Ls, Lsc, Lsd, Lw, R, Rb, Rs, Rsc, Rsd, Rw, Tbl, Tbr, Tc, Tfc, Tfl,
-        Tfr, Tsl, Tsr,
+        AuroC, AuroHc, AuroHl, AuroHls, AuroHr, AuroHrs, AuroL, AuroLb, AuroLs, AuroR, AuroRb,
+        AuroRs, AuroT, C, Cb, L, LFE, LFE2, Lb, Ls, Lsc, Lsd, Lw, R, Rb, Rs, Rsc, Rsd, Rw, Tbl,
+        Tbr, Tc, Tfc, Tfl, Tfr, Tsl, Tsr,
     };
-    const FIXED: [RChannelLabel; 24] = [
+    const FIXED: [RChannelLabel; 37] = [
         L, R, C, LFE, Ls, Rs, Lb, Rb, Tfl, Tfr, Tbl, Tbr, Lsc, Rsc, Cb, Lsd, Rsd, Lw, Rw, LFE2,
-        Tsl, Tsr, Tc, Tfc,
+        Tsl, Tsr, Tc, Tfc, AuroL, AuroR, AuroC, AuroLs, AuroRs, AuroLb, AuroRb, AuroHl, AuroHr,
+        AuroHc, AuroHls, AuroHrs, AuroT,
     ];
     let entries: Vec<serde_json::Value> = FIXED
         .iter()
@@ -463,6 +564,20 @@ fn resolve_virtual_bed_pose_raw(
                 room_ratio_center_blend,
             ));
         }
+    }
+
+    // Auro's height layer, which is an angle rather than a corner: it goes
+    // through the polar conversion so it lands on Auro's stated elevation
+    // whatever the room ratio is, instead of being carried around by the warp
+    // the way a corner channel deliberately is.
+    if let Some(pose) = auro_virtual_bed_pose(
+        label,
+        room_ratio,
+        room_ratio_rear,
+        room_ratio_lower,
+        room_ratio_center_blend,
+    ) {
+        return Some(pose);
     }
 
     // Cartesian corner fallback: use x/y/z directly (clamped), exactly like the
@@ -1200,6 +1315,74 @@ mod tests {
 
     const UNIT_ROOM: [f32; 3] = [1.0, 1.0, 1.0];
 
+    /// Every Auro speaker renders where Auro says it does, and goes on doing
+    /// so in a room that is not a cube.
+    ///
+    /// The angles are Table 3 ("Normative Speaker Positions", nominal column)
+    /// of the AURO-3D Home Theater Setup Guidelines v12, 2024-05-16. The
+    /// second room is the engine's own default (`1.0,2.0,1.0`), which is where
+    /// this used to go wrong: a corner-shaped pose is carried around by the
+    /// depth warp, and Auro asks for speakers "equidistant from the main
+    /// listening position" instead.
+    #[test]
+    fn auro_height_layer_sits_at_its_normative_angles() {
+        use RChannelLabel::{
+            AuroC, AuroHc, AuroHl, AuroHls, AuroHr, AuroHrs, AuroL, AuroLb, AuroLs, AuroR, AuroRb,
+            AuroRs, AuroT,
+        };
+
+        // label, name, azimuth, elevation
+        const TABLE_3: [(RChannelLabel, &str, f32, f32); 13] = [
+            (AuroL, "L", -30.0, 0.0),
+            (AuroR, "R", 30.0, 0.0),
+            (AuroC, "C", 0.0, 0.0),
+            (AuroLs, "Ls", -110.0, 0.0),
+            (AuroRs, "Rs", 110.0, 0.0),
+            (AuroLb, "Lb", -150.0, 0.0),
+            (AuroRb, "Rb", 150.0, 0.0),
+            (AuroHl, "HL", -30.0, 30.0),
+            (AuroHr, "HR", 30.0, 30.0),
+            (AuroHc, "HC", 0.0, 30.0),
+            (AuroHls, "HLs", -110.0, 30.0),
+            (AuroHrs, "HRs", 110.0, 30.0),
+            (AuroT, "T", 0.0, 90.0),
+        ];
+
+        for (room, rear) in [(UNIT_ROOM, 1.0f32), ([1.0, 2.0, 1.0], 2.0f32)] {
+            for (label, name, want_az, want_el) in TABLE_3 {
+                let (_, x, y, z) = resolve_virtual_bed_pose(
+                    label,
+                    false,
+                    None,
+                    room,
+                    rear,
+                    0.5,
+                    0.5,
+                    SurroundPlacement::Side,
+                )
+                .unwrap_or_else(|| panic!("no pose for {name}"));
+
+                // What the binaural stage reads off the room-scaled position.
+                let [px, py, pz] =
+                    omniphony_geometry::f32::room_scaled_position([x, y, z], room, rear, 0.5, 0.5);
+                let az = px.atan2(py).to_degrees();
+                let el = pz.atan2((px * px + py * py).sqrt()).to_degrees();
+
+                assert!(
+                    (el - want_el).abs() < 0.05,
+                    "{name} elevation in room {room:?}: want {want_el}, got {el}"
+                );
+                // Straight overhead has no azimuth to be wrong about.
+                if want_el < 89.9 {
+                    assert!(
+                        (az - want_az).abs() < 0.05,
+                        "{name} azimuth in room {room:?}: want {want_az}, got {az}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fixed_channel_catalog_covers_every_fixed_label_with_canonical_poses() {
         let catalog: serde_json::Value =
@@ -1213,7 +1396,9 @@ mod tests {
             labels,
             [
                 "L", "R", "C", "LFE", "Ls", "Rs", "Lb", "Rb", "TFL", "TFR", "TBL", "TBR", "Lsc",
-                "Rsc", "Cb", "Lsd", "Rsd", "Lw", "Rw", "LFE2", "TSL", "TSR", "TC", "TFC",
+                "Rsc", "Cb", "Lsd", "Rsd", "Lw", "Rw", "LFE2", "TSL", "TSR", "TC", "TFC", "AuroL",
+                "AuroR", "AuroC", "AuroLs", "AuroRs", "AuroLb", "AuroRb", "AuroHL", "AuroHR",
+                "AuroHC", "AuroHLs", "AuroHRs", "AuroT",
             ]
         );
 

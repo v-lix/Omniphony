@@ -57,6 +57,24 @@ enum OrenderChannelLabel {
     OrenderChannelLabel_Lfe2 = 23,
     // The channel carries dynamic-object audio (position driven by metadata).
     OrenderChannelLabel_Object = 24,
+    // Auro-3D's speakers. Auro states an exact angle for each and asks for
+    // them equidistant from the listener, so they are placed from its own
+    // table rather than at the room corners the labels above describe. The
+    // LFE and the 12.1 centre surround are not here: no Auro document gives
+    // either an angle, so they keep `Lfe` and `Cb`.
+    OrenderChannelLabel_AuroL = 25,
+    OrenderChannelLabel_AuroR = 26,
+    OrenderChannelLabel_AuroC = 27,
+    OrenderChannelLabel_AuroLs = 28,
+    OrenderChannelLabel_AuroRs = 29,
+    OrenderChannelLabel_AuroLb = 30,
+    OrenderChannelLabel_AuroRb = 31,
+    OrenderChannelLabel_AuroHl = 32,
+    OrenderChannelLabel_AuroHr = 33,
+    OrenderChannelLabel_AuroHc = 34,
+    OrenderChannelLabel_AuroHls = 35,
+    OrenderChannelLabel_AuroHrs = 36,
+    OrenderChannelLabel_AuroT = 37,
     OrenderChannelLabel_Unknown = 255,
 };
 typedef uint8_t OrenderChannelLabel;

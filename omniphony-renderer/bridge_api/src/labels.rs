@@ -155,6 +155,32 @@ const ALIASES: &[(RChannelLabel, &[&str])] = &[
         &["TC", "TPC", "TOPCENTER", "TOPMIDDLECENTER"],
     ),
     (RChannelLabel::Tfc, &["TFC", "TPFC", "TOPFRONTCENTER"]),
+    // Auro's speakers. Every spelling is qualified, including the ones that
+    // would not collide today: `L` and `HL` already answer for other places,
+    // and a layout that names a speaker `L` means the one every other format
+    // means. Auro's are a different set of positions and say so.
+    (RChannelLabel::AuroL, &["AUROL", "AUROLEFT"]),
+    (RChannelLabel::AuroR, &["AUROR", "AURORIGHT"]),
+    (RChannelLabel::AuroC, &["AUROC", "AUROCENTER", "AUROCENTRE"]),
+    (RChannelLabel::AuroLs, &["AUROLS", "AUROLEFTSURROUND"]),
+    (RChannelLabel::AuroRs, &["AURORS", "AURORIGHTSURROUND"]),
+    (RChannelLabel::AuroLb, &["AUROLB", "AUROLEFTBACK"]),
+    (RChannelLabel::AuroRb, &["AURORB", "AURORIGHTBACK"]),
+    (RChannelLabel::AuroHl, &["AUROHL", "AUROHEIGHTLEFT"]),
+    (RChannelLabel::AuroHr, &["AUROHR", "AUROHEIGHTRIGHT"]),
+    (
+        RChannelLabel::AuroHc,
+        &["AUROHC", "AUROHEIGHTCENTER", "AUROHEIGHTCENTRE"],
+    ),
+    (
+        RChannelLabel::AuroHls,
+        &["AUROHLS", "AUROHEIGHTLEFTSURROUND"],
+    ),
+    (
+        RChannelLabel::AuroHrs,
+        &["AUROHRS", "AUROHEIGHTRIGHTSURROUND"],
+    ),
+    (RChannelLabel::AuroT, &["AUROT", "AUROTOP", "AUROVOG"]),
 ];
 
 /// Canonical short name for a label — the form used in bundled layout YAMLs,
@@ -188,6 +214,19 @@ pub fn canonical_name(label: RChannelLabel) -> &'static str {
         Tbr => "TBR",
         Tc => "TC",
         Tfc => "TFC",
+        AuroL => "AuroL",
+        AuroR => "AuroR",
+        AuroC => "AuroC",
+        AuroLs => "AuroLs",
+        AuroRs => "AuroRs",
+        AuroLb => "AuroLb",
+        AuroRb => "AuroRb",
+        AuroHl => "AuroHL",
+        AuroHr => "AuroHR",
+        AuroHc => "AuroHC",
+        AuroHls => "AuroHLs",
+        AuroHrs => "AuroHRs",
+        AuroT => "AuroT",
         Object => "Object",
         Unknown => "Unknown",
     }
