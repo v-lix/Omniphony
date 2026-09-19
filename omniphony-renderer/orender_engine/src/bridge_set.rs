@@ -519,6 +519,15 @@ impl BridgeSet {
         self.current().channel_tags()
     }
 
+    /// Release what the bridge that has the stream still holds at its end
+    /// ([`FormatBridge::drain`](bridge_api::FormatBridge::drain)). Only that
+    /// bridge: another holds nothing of this stream, and undecided bytes no
+    /// bridge claimed were never decoded. A fork addition, with the method it
+    /// forwards.
+    pub fn drain(&mut self) -> RPushResult {
+        self.slots[self.active].bridge.drain()
+    }
+
     fn slot_name(&self, index: usize) -> String {
         format!("bridge {}", index + 1)
     }
@@ -856,6 +865,7 @@ mod tests {
         resets: usize,
         configured: Vec<(String, String)>,
         drc: Vec<String>,
+        drains: usize,
     }
 
     struct TestBridge {
@@ -914,6 +924,10 @@ mod tests {
         }
         fn fixed_channel_poses(&self) -> RVec<RChannelPose> {
             RVec::new()
+        }
+        fn drain(&mut self) -> RPushResult {
+            self.log.lock().unwrap().drains += 1;
+            empty_result()
         }
     }
 
@@ -1045,6 +1059,28 @@ mod tests {
         set.push_packet(b"", RInputTransport::Iec61937, 0x42);
         assert_eq!(bytes(&log), b"xyz");
         assert_eq!(log.lock().unwrap().bursts, [0x42]);
+    }
+
+    #[test]
+    fn a_drain_goes_to_the_bridge_that_has_the_stream() {
+        let (mut set, a, b) = set_ab();
+        push_raw(&mut set, b"..BBBBpayload");
+        set.drain();
+        assert_eq!(b.lock().unwrap().drains, 1);
+        assert_eq!(a.lock().unwrap().drains, 0);
+
+        let log = Arc::default();
+        let mut single = BridgeSet::single(test_bridge(&log));
+        single.drain();
+        assert_eq!(log.lock().unwrap().drains, 1);
+
+        // Over IEC 61937 the burst type moves the stream, and the drain with it.
+        let (mut set, a, b) = set_ab();
+        set.push_packet(b"", RInputTransport::Iec61937, 0x15);
+        set.push_packet(b"", RInputTransport::Iec61937, 0x0B);
+        set.drain();
+        assert_eq!(b.lock().unwrap().drains, 1);
+        assert_eq!(a.lock().unwrap().drains, 0);
     }
 
     #[test]

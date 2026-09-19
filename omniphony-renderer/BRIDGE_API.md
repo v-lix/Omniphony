@@ -16,6 +16,10 @@ format-specific parsing, decode pipeline, and spatial metadata extraction.
 version.** Rebuild the bridge with the host: a bridge built against
 `bridge_api` 0.6.x loads in every host built against 0.6.x, and in no other.
 
+This fork's `bridge_api` is 0.7, one minor past upstream's 0.6, because it
+appends `FormatBridge::drain` (see [`ABI.md`](ABI.md)). Its bridges load only
+in its own hosts, and upstream's only in upstream's.
+
 - **What bumps the minor.** Any change to what crosses the boundary: a
   `FormatBridge` method, a `BridgeLib` field, a field, a variant or a
   discriminant of a type the two sides exchange. Adding a method with a
@@ -245,6 +249,8 @@ pub trait FormatBridge: Send + Sync + 'static {
     fn source_family(&self) -> RString;
     fn source_label(&self) -> RString;
     fn channel_tags(&self) -> RVec<RChannelTag>;
+    // This fork's addition: release what is held at end of stream.
+    fn drain(&mut self) -> RPushResult;
 }
 ```
 

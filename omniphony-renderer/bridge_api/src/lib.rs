@@ -536,6 +536,45 @@ pub trait FormatBridge: Send + Sync + 'static {
     fn channel_tags(&self) -> RVec<RChannelTag> {
         RVec::new()
     }
+
+    /// Emit whatever the pipeline is still holding, because no more input is
+    /// coming.
+    ///
+    /// A bridge cannot always decide an access unit on arrival. An E-AC-3
+    /// independent substream may be the first half of a presentation and
+    /// nothing in it says whether a dependent follows, so the bridge holds it
+    /// until the next unit answers that — and at the end of a stream the next
+    /// unit never arrives. Without this the last held unit is simply dropped,
+    /// losing the final pending access unit.
+    ///
+    /// This is the host saying the stream is over: resolve what is in hand and
+    /// return it as [`push_packet`] would. Distinct from [`reset`], which
+    /// discards the same state on purpose — a seek is not supposed to emit the
+    /// audio it seeks away from.
+    ///
+    /// Idempotent and safe on an idle bridge: a second call, or a call on a
+    /// bridge holding nothing, returns no frames.
+    ///
+    /// The bridge stays usable afterwards, and keeps its decoder state: this
+    /// releases what was held, it does not clear anything else. So a host
+    /// continuing the same stream can keep pushing straight after, and one
+    /// starting unrelated content still owes a [`reset`] — draining is not a
+    /// cheaper way to spell it.
+    ///
+    /// A fork addition, appended after upstream's methods: it is why this
+    /// fork's `bridge_api` is one minor past upstream's. A bridge without a
+    /// tail to release can omit it and take the empty default, but it still
+    /// has to be rebuilt against this minor to load.
+    ///
+    /// [`push_packet`]: FormatBridge::push_packet
+    /// [`reset`]: FormatBridge::reset
+    fn drain(&mut self) -> RPushResult {
+        RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        }
+    }
 }
 
 /// Owned, heap-allocated bridge trait object.
