@@ -104,3 +104,28 @@ been collected. `orender_reset` discards it.
 3. If breaking: expect the soname to change; update packaging (`PKGBUILD`
    symlinks) and warn mpv-omniphony (bundled lib name changes).
 4. `cargo test -p orender_ffi` + run `examples/smoke.c` (CI does both).
+
+## Fork additions (C ABI 0.13)
+
+Upstream ABI 8 to 12 entry points retain their values and contracts.
+
+The Rust plugin interface is `bridge_api` 0.7, one minor past upstream's 0.6
+for the method described below; its package version is independent of the C
+ABI minor. Rebuild the matching renderer and plugins.
+
+`orender_drain` (see End of stream) also releases pending decoder audio in
+this fork: once the decode thread holds nothing more, the access unit a bridge
+kept back to see what follows it, as the last call before 0 frames. The
+contract is unchanged — not a reset, not a DSP/reverb-tail flush, one packet's
+audio per call until 0 frames, a short buffer keeps the audio for the retry,
+and reset discards it.
+
+`FormatBridge::drain` is appended after upstream's methods, with an empty
+successful default, so source implementations without a tail can omit it.
+It grows the vtable, so under upstream's versioning policy (BRIDGE_API.md,
+"Versioning") it bumps `bridge_api` to 0.7: the loader refuses a bridge built
+against upstream's 0.6 by version, naming both, and an upstream host refuses
+this fork's bridges the same way. Rebuild the matching renderer and plugins
+together. Bridges that hold an access unit must override drain to release
+it; PCM and WAV bridges emit complete sample frames immediately and have no
+decoder tail to release.
