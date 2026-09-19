@@ -9,9 +9,10 @@ description = "C ABI for the orender spatial audio renderer (produces liborender
 repository = "https://github.com/mgth/Omniphony"
 
 [lib]
-# Produces liborender.so / orender.dll
+# cdylib produces liborender.so / orender.dll. The rlib lets integration tests
+# under tests/ drive the same public entry points from Rust.
 name = "orender"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 orender_engine = { version = "0.2.2", path = "../orender_engine" }
@@ -25,6 +26,8 @@ env_logger = "0.11"
 [dev-dependencies]
 # The OrenderChannelLabel ↔ RChannelLabel discriminant-parity unit test.
 bridge_api = { version = "0.4.0", path = "../bridge_api" }
+abi_stable = "0.11"
+renderer = { version = "0.2.4", path = "../renderer" }
 
 [features]
 # SOFA (personalised HRTF) support, on by default: liborender is the desktop

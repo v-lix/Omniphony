@@ -75,3 +75,21 @@ renderer must be reopened at the source rate. Probe the symbol, not minor 10.
 
 The Rust plugin interface remains `bridge_api` 0.4; its package version is
 independent of the C ABI minor. Rebuild the matching renderer and plugins.
+
+`orender_drain` releases pending decoder audio at end of input without
+resetting the renderer. It is not a DSP/reverb-tail flush and must not be
+called instead of reset on a seek. A successful repeated drain emits no
+additional frames. A short output buffer returns 1 with zero output frames
+and retains the rendered tail; retry drain with a larger buffer before
+sending more input. Reset discards any retained tail.
+
+`FormatBridge::drain` is appended after upstream 0.4's method prefix and
+optional family/label methods, with an empty successful default. Source
+implementations without a tail can omit it when rebuilt against this API.
+An already-built upstream 0.4 plugin has a shorter method table and is rejected
+by the new host's `abi_stable` layout check; the default does not make that
+binary loadable. The reverse direction (upstream host loading a rebuilt plugin)
+passes the layout check. Keep those checks enabled and rebuild the matching
+renderer and plugins together. Bridges that hold an access unit must override
+drain to release it; PCM and WAV bridges emit complete sample frames
+immediately and have no decoder tail to release.

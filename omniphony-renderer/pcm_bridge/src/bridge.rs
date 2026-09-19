@@ -227,6 +227,18 @@ impl FormatBridge for PcmBridge {
         self.reset_state();
     }
 
+    /// Complete sample frames are emitted as soon as their bytes arrive; no
+    /// unit waits for a successor to decide it. A trailing partial frame is a
+    /// truncated write, not a frame; completing it here would invent samples
+    /// the host never sent. Keep it buffered if the host resumes this stream.
+    fn drain(&mut self) -> RPushResult {
+        RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        }
+    }
+
     fn is_ready(&self) -> bool {
         self.frames_emitted > 0
     }
@@ -428,6 +440,14 @@ mod tests {
         let r = push(&mut bridge, &pcm[..11]);
         assert_eq!(r.frames.iter().map(|f| f.sample_count).sum::<u32>(), 1);
         assert_eq!(r.frames[0].pcm.as_slice(), &[11, 22]);
+
+        // EOF cannot invent the missing bytes or discard them if input resumes.
+        for _ in 0..2 {
+            let drained = bridge.drain();
+            assert!(drained.frames.is_empty());
+            assert!(drained.error_message.is_empty());
+            assert!(!drained.did_reset);
+        }
 
         // The rest of it arrives.
         let r = push(&mut bridge, &pcm[11..]);

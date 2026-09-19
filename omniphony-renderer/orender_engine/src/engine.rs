@@ -124,6 +124,8 @@ pub struct Engine {
     /// that never recycles allocates exactly as before; it is an optimisation,
     /// not a contract.
     output_pool: Vec<Vec<f32>>,
+    /// Drained output retained until a bounded host buffer can receive it.
+    pending_drain_output: Vec<RenderedAudio>,
     /// Duty-cycle EMA of the render cost, for the meter bundle: raw per-frame
     /// timings alias with 40-sample TrueHD access units (the FIR crossover's
     /// burst lands on one frame in ~26), so the emitted figure is smoothed to
@@ -300,6 +302,7 @@ impl Engine {
             frame_events: Vec::new(),
             pcm_f32_buf: Vec::new(),
             output_pool: Vec::new(),
+            pending_drain_output: Vec::new(),
             render_duty: Default::default(),
             osc: None,
             audio_meter: None,
@@ -700,6 +703,8 @@ impl Engine {
     /// per-stream spatial state. Live parameters (gains, layout, OSC-applied
     /// settings) are preserved — a seek must not lose live adjustments.
     pub fn reset(&mut self) {
+        let pending = std::mem::take(&mut self.pending_drain_output);
+        self.recycle(pending);
         self.bridge.bridge.reset();
         self.renderer.reset_runtime_state();
         self.reset_segment_state();
@@ -869,6 +874,9 @@ impl Engine {
         transport: RInputTransport,
         data_type: u8,
     ) -> Result<Vec<RenderedAudio>> {
+        if !self.pending_drain_output.is_empty() {
+            bail!("drain output is pending; retry drain with a larger buffer before new input");
+        }
         // Push any DRC-mode change (config-seeded or OSC-driven) to the decoder
         // before it decodes this packet.
         self.sync_drc_mode();
@@ -884,18 +892,7 @@ impl Engine {
             bail!("bridge decode error: {}", result.error_message);
         }
         if result.did_reset {
-            // Sync-loss recovery / seek inside the bridge: drop stale spatial
-            // state but keep live params and the absolute sample clock. Also bump
-            // the content generation, force a full object re-emit and clear the
-            // overlay so OSC clients and the overlay purge the pre-seek objects
-            // instead of leaving them behind as stale duplicates.
-            self.renderer.reset_runtime_state();
-            self.reset_segment_state();
-            if let Some(osc) = self.osc.as_mut() {
-                osc.bump_content_generation();
-                osc.request_full_object_resend();
-            }
-            overlay::clear();
+            self.handle_bridge_reset();
         }
 
         // The bridge decodes one packet into N frames synchronously; attribute the
@@ -916,9 +913,82 @@ impl Engine {
         Ok(out)
     }
 
+    fn handle_bridge_reset(&mut self) {
+        // Sync-loss recovery / seek inside the bridge: drop stale spatial
+        // state but keep live params and the absolute sample clock. Also bump
+        // the content generation, force a full object re-emit and clear the
+        // overlay so OSC clients and the overlay purge the pre-seek objects
+        // instead of leaving them behind as stale duplicates.
+        self.renderer.reset_runtime_state();
+        self.reset_segment_state();
+        if let Some(osc) = self.osc.as_mut() {
+            osc.bump_content_generation();
+            osc.request_full_object_resend();
+        }
+        overlay::clear();
+    }
+
     /// Convenience wrapper for hosts that always feed raw access units.
     pub fn process_raw(&mut self, data: &[u8]) -> Result<Vec<RenderedAudio>> {
         self.process(data, RInputTransport::Raw, 0)
+    }
+
+    /// Render whatever the bridge is still holding, because the stream is over.
+    ///
+    /// A bridge that buffers an access unit to see what follows it is holding
+    /// one when the input ends, and no further [`process`](Self::process) call
+    /// is coming to release it. The host calls this once at end of stream and
+    /// plays what comes back, including the final pending E-AC-3 access unit
+    /// that would otherwise be dropped with the bridge's pending state.
+    ///
+    /// Not a [`reset`](Self::reset): the renderer keeps its per-object and ramp
+    /// state, because these frames are the continuation of the ones before them
+    /// and resetting first would fade them in from nothing. Safe to call on an
+    /// idle engine, and safe to call twice — the second returns nothing.
+    pub fn drain(&mut self) -> Result<Vec<RenderedAudio>> {
+        if !self.pending_drain_output.is_empty() {
+            return Ok(std::mem::take(&mut self.pending_drain_output));
+        }
+        let decode_started = std::time::Instant::now();
+        let result = self.bridge.bridge.drain();
+        let decode_time_ms = decode_started.elapsed().as_secs_f32() * 1000.0;
+
+        if !result.error_message.is_empty() {
+            bail!("bridge drain error: {}", result.error_message);
+        }
+        if result.did_reset {
+            self.handle_bridge_reset();
+        }
+
+        let per_frame_decode_time_ms = if result.frames.is_empty() {
+            decode_time_ms
+        } else {
+            decode_time_ms / result.frames.len() as f32
+        };
+
+        let mut out = Vec::with_capacity(result.frames.len());
+        for frame in result.frames.iter() {
+            if let Some(chunk) = self.render_frame(frame, per_frame_decode_time_ms)? {
+                out.push(chunk);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drain for a host with bounded output capacity. None means retry this
+    /// method with more space, before pushing further input. Keep the rendered
+    /// audio on a short buffer: calling the decoder again cannot recreate it.
+    pub fn drain_with_capacity(
+        &mut self,
+        max_samples: usize,
+    ) -> Result<Option<Vec<RenderedAudio>>> {
+        let chunks = self.drain()?;
+        if chunks.iter().map(|c| c.samples.len()).sum::<usize>() > max_samples {
+            self.pending_drain_output = chunks;
+            Ok(None)
+        } else {
+            Ok(Some(chunks))
+        }
     }
 
     /// Hand the sample buffers of a consumed [`process`](Self::process) result
