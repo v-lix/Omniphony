@@ -208,8 +208,9 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     the last call returned); orender_process now reads its pts_us argument.
 // 12: added the `heard_us` key of orender_set_option (where the listener is,
 //     relayed to OSC clients as /omniphony/playout/heard).
-// 13: fork addition orender_decoded_sample_rate, the bridge's actual output
-//     rate so a host can detect a mismatch with its configured session rate.
+// 13: fork additions orender_decoded_sample_rate, the bridge's actual output
+//     rate so a host can detect a mismatch with its configured session rate,
+//     and orender_drain releasing a pending decoder access unit at EOF too.
 pub const ORENDER_ABI_MINOR: u32 = 13;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -836,13 +837,21 @@ pub unsafe extern "C" fn orender_process(
 
 /// Render what the engine still holds, because the stream is over: with the
 /// `decode_thread` option on, the packets it has been handed and not returned
-/// yet. One packet's audio per call, as `orender_process` returns it, so a
-/// buffer that fits one packet's audio fits a drain too: after the last packet,
-/// call it until it returns 0 frames, and play what each call returns.
+/// yet, and then whatever the decoder is still holding. A bridge cannot always
+/// decide an access unit on arrival — an E-AC-3 independent substream may be
+/// the first half of a presentation, and only the unit after it says whether
+/// it is — so one is held back when the input ends and no further
+/// `orender_process` call is coming to release it. One packet's audio per call,
+/// as `orender_process` returns it, so a buffer that fits one packet's audio
+/// fits a drain too: after the last packet, call it until it returns 0 frames,
+/// and play what each call returns.
 ///
 /// Not a reset: the renderer keeps its state, because this audio continues
-/// what came before. Once it has returned 0 frames it keeps returning 0 until
-/// new input. `out` and the out-parameters are as for `orender_process`.
+/// what came before, and a seek, which is meant to discard the audio it seeks
+/// away from, calls `orender_reset` instead. Once it has returned 0 frames it
+/// keeps returning 0 until new input, and the engine stays usable afterwards,
+/// so a host may drain and keep pushing. `out` and the out-parameters are as
+/// for `orender_process`.
 ///
 /// Returns: 0 = OK (0 frames: nothing is left), >0 = output buffer too small
 /// (nothing written; call drain again with a larger buffer before sending

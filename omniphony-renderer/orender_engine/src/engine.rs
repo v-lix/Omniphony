@@ -986,16 +986,21 @@ impl Engine {
     }
 
     /// Render what the engine still holds, because the stream is over: with the
-    /// decode thread on, the packets it has been handed and not returned yet.
-    /// One packet's audio per call, oldest first, as [`process`](Self::process)
-    /// returns it, so a buffer that fits one packet's audio fits a drain too:
-    /// the host calls this at end of stream until it returns nothing, and plays
-    /// what comes back.
+    /// decode thread on, the packets it has been handed and not returned yet,
+    /// and then whatever the bridge is still holding. A bridge that buffers an
+    /// access unit to see what follows it is holding one when the input ends,
+    /// and no further [`process`](Self::process) call is coming to release it:
+    /// the final pending E-AC-3 access unit, which would otherwise be dropped
+    /// with the bridge's pending state. One packet's audio per call, oldest
+    /// first, as [`process`](Self::process) returns it, so a buffer that fits
+    /// one packet's audio fits a drain too: the host calls this at end of
+    /// stream until it returns nothing, and plays what comes back.
     ///
     /// Not a [`reset`](Self::reset): the renderer keeps its per-object and ramp
-    /// state, because these frames are the continuation of the ones before them.
-    /// Safe to call on an idle engine, and safe to call again once it has
-    /// returned nothing — it returns nothing again.
+    /// state, because these frames are the continuation of the ones before them
+    /// and resetting first would fade them in from nothing. Safe to call on an
+    /// idle engine, and safe to call again once it has returned nothing — it
+    /// returns nothing again.
     pub fn drain(&mut self) -> Result<Vec<RenderedAudio>> {
         match self.held.take() {
             Some((HeldFor::Drain, held)) => return Ok(held),
@@ -1003,7 +1008,33 @@ impl Engine {
             Some((HeldFor::Packet, held)) => self.recycle(held),
             None => {}
         }
-        self.next_in_flight()
+        // What the decode thread was handed is earlier in the stream than what
+        // the bridge still holds, so it comes out first, a packet per call.
+        let out = self.next_in_flight()?;
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        // Rendered like any decoded packet. It is the rest of the stream the
+        // frames before it began, so it keeps the declaration they carried
+        // rather than reading the bridge here, on the engine's thread, which
+        // the decode thread's reads are there to spare. It answers no host
+        // packet, so it carries no host timestamp.
+        let packet = {
+            let mut bridge = self.bridge.lock().unwrap_or_else(|e| e.into_inner());
+            let started = std::time::Instant::now();
+            let result = bridge.bridge.drain();
+            let decode_ms = started.elapsed().as_secs_f32() * 1000.0;
+            self.bridge_has_objects
+                .store(bridge.bridge.has_objects(), Ordering::Relaxed);
+            DecodedPacket {
+                result,
+                decode_ms,
+                declaration: None,
+                declaration_frame: 0,
+            }
+        };
+        self.render_decoded(packet, None)
+            .map_err(|e| anyhow!("bridge drain: {e:#}"))
     }
 
     /// Drain for a host with bounded output capacity. None means retry this

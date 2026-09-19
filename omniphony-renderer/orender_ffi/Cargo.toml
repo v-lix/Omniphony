@@ -8,9 +8,10 @@ description = "C ABI for the orender spatial audio renderer (produces liborender
 repository.workspace = true
 
 [lib]
-# Produces liborender.so / orender.dll
+# cdylib produces liborender.so / orender.dll. The rlib lets integration tests
+# under tests/ drive the same public entry points from Rust.
 name = "orender"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 orender_engine.workspace = true
@@ -24,6 +25,9 @@ env_logger.workspace = true
 [dev-dependencies]
 # The OrenderChannelLabel ↔ RChannelLabel discriminant-parity unit test.
 bridge_api.workspace = true
+# tests/decoder.rs: the C entry points driven over a bridge scripted in-process.
+abi_stable.workspace = true
+renderer.workspace = true
 
 [features]
 # SOFA (personalised HRTF) support, on by default: liborender is the desktop
