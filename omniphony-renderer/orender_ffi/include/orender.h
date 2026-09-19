@@ -273,13 +273,20 @@ int orender_process(struct OrenderRenderer *r,
 
 // Render what the engine still holds, because the stream is over: with the
 // `decode_thread` option on, the packets it has been handed and not returned
-// yet. One packet's audio per call, as [`orender_process`] returns it, so a
-// buffer that fits one packet's audio fits a drain too: after the last packet,
-// call it until it returns 0 frames, and play what each call returns.
+// yet, and then whatever the decoder is still holding. A bridge cannot always
+// decide an access unit on arrival — an E-AC-3 independent substream may be
+// the first half of a presentation, and only the unit after it says whether
+// it is — so one is held back when the input ends and no further
+// [`orender_process`] call is coming to release it. One packet's audio per
+// call, as [`orender_process`] returns it, so a buffer that fits one packet's
+// audio fits a drain too: after the last packet, call it until it returns 0
+// frames, and play what each call returns.
 //
-// Not a reset: the renderer keeps its state, because this audio continues
-// what came before. Once it has returned 0 frames it keeps returning 0 until
-// new input. `out` and the out-parameters are as for [`orender_process`].
+// Not a substitute for [`orender_reset`], and not to be called on a seek: a
+// seek is meant to discard the audio it seeks away from, and this emits it.
+// Once it has returned 0 frames it keeps returning 0 until new input, and the
+// engine stays usable afterwards, so a host may drain and keep pushing.
+// `out` and the out-parameters are as for [`orender_process`].
 //
 // Returns: 0 = OK (0 frames: nothing is left), >0 = output buffer too small
 // (nothing written; call drain again with a larger buffer before sending

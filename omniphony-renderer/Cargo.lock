@@ -1646,12 +1646,14 @@ dependencies = [
 name = "orender_ffi"
 version = "0.6.0"
 dependencies = [
+ "abi_stable",
  "anyhow",
  "bridge_api",
  "cbindgen",
  "env_logger",
  "log",
  "orender_engine",
+ "renderer",
  "runtime_control",
 ]
 

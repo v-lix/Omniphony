@@ -47,11 +47,9 @@ fn reference() -> Option<Stream> {
     let (mut engine, data) = setup(false)?;
     let packets: Vec<&[u8]> = data.chunks(PACKET).collect();
     let mut out = Stream::new();
-    let drained = render(&mut engine, &packets, &mut out);
-    assert_eq!(
-        drained, 0,
-        "with the thread off there is nothing left to drain"
-    );
+    // With the thread off the drain holds only what the bridge kept back to
+    // see what follows it: nothing for TrueHD, the last access unit for E-AC-3.
+    render(&mut engine, &packets, &mut out);
     Some(out)
 }
 

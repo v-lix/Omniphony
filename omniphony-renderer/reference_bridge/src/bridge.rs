@@ -234,6 +234,16 @@ impl FormatBridge for WavBridge {
         self.reset_state();
     }
 
+    /// Nothing is ever held back: a WAV frame is complete the moment its bytes
+    /// have arrived, so no unit is waiting on a successor to decide it.
+    fn drain(&mut self) -> RPushResult {
+        RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        }
+    }
+
     fn is_ready(&self) -> bool {
         self.frames_emitted > 0
     }
