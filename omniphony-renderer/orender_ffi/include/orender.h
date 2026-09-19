@@ -274,6 +274,32 @@ int orender_process(struct OrenderRenderer *r,
                     uint32_t *out_channels,
                     int64_t *out_pts_us);
 
+// Render whatever the decoder is still holding, at end of stream.
+//
+// A bridge cannot always decide an access unit on arrival — an E-AC-3
+// independent substream may be the first half of a presentation, and only the
+// unit after it says whether it is — so one is held back when the input ends
+// and no further [`orender_process`] call is coming to release it. Call this
+// once, after the last packet, and play what it returns: for E-AC-3 that is
+// the final 32 ms of the track, which is otherwise dropped.
+//
+// Same output contract as [`orender_process`]: the caller owns `out`
+// (capacity `out_cap_samples` floats), and `*out_frames` / `*out_channels` /
+// `*out_pts_us` are set on success. Returns 0 = OK (may be 0 frames — nothing
+// was held), >0 = output buffer too small (nothing written; retry larger),
+// <0 = error.
+//
+// Not a substitute for [`orender_reset`], and not to be called on a seek: a
+// seek is meant to discard the audio it seeks away from, and this emits it.
+// Idempotent — calling it twice, or on an idle engine, returns 0 frames — and
+// the engine stays usable afterwards, so a host may drain and keep pushing.
+int orender_drain(struct OrenderRenderer *r,
+                  float *out,
+                  uintptr_t out_cap_samples,
+                  uintptr_t *out_frames,
+                  uint32_t *out_channels,
+                  int64_t *out_pts_us);
+
 // Render the spatial overlay for the given OSD resolution and copy the ASS
 // `osd-overlay` payload into `out` (UTF-8, not nul-terminated).
 //

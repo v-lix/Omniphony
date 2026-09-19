@@ -222,6 +222,19 @@ impl FormatBridge for PcmBridge {
         self.reset_state();
     }
 
+    /// Nothing is ever held back: a chunk is emitted as soon as the header in
+    /// front of it says how many samples it is, so there is no unit waiting on
+    /// a successor to decide it. A trailing partial chunk is a truncated write,
+    /// not a frame, and completing it here would invent samples the host never
+    /// sent.
+    fn drain(&mut self) -> RPushResult {
+        RPushResult {
+            frames: RVec::new(),
+            error_message: RString::new(),
+            did_reset: false,
+        }
+    }
+
     fn is_ready(&self) -> bool {
         self.frames_emitted > 0
     }

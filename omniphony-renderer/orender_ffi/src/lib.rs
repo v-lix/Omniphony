@@ -202,17 +202,24 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 // 7: added orender_output_latency_samples (constant DSP latency of the
 //    rendered output, for host A/V sync compensation — non-zero when the
 //    linear-phase FIR crossover is active).
-// 8: this fork's symbols, which upstream's 7 does not carry. Both answer a
-//    question only the decoder can, and both are probed rather than required,
-//    so they share the one number instead of taking one each: the minor is a
-//    diagnostic counter and a host that reads it to decide anything is already
-//    doing the wrong thing (see ABI.md - gate on symbol presence).
+// 8: this fork's additions, which upstream's 7 does not carry. They are one
+//    set under one number rather than a number each: every one of them is
+//    additive and probed by symbol presence, and the minor is a diagnostic
+//    counter, so a host that reads it to decide anything is already doing the
+//    wrong thing (see ABI.md - gate on symbol presence). The number moves when
+//    upstream's does, not when this fork adds to its own set.
 //    - orender_decoded_sample_rate: the rate the bridge actually decoded at,
 //      so a host that named the wrong rate at create time can re-open at this
 //      one.
 //    - orender_presentation_name: what the stream presents itself as when its
 //      container does not name it — an Auro-Codec carrier is an ordinary
 //      DTS-HD MA track until a decoder reads its side channel.
+//    - orender_drain: render what the decoder is still holding when the input
+//      ends. A bridge that buffers an access unit to see what follows it has
+//      one in hand at end of stream and nothing left to release it, so the
+//      tail of every track was being dropped — 32 ms for E-AC-3. A host that
+//      does not call it behaves exactly as before, which is why this is a new
+//      symbol rather than a change to orender_process.
 //    - the AuroL..AuroT OrenderChannelLabel values, for the speakers Auro-3D
 //      places itself. Appended, so a host that does not know them reads them
 //      as the unknown bytes they are; nothing existing moved.
@@ -749,6 +756,75 @@ pub unsafe extern "C" fn orender_reset(r: *mut OrenderRenderer) {
     }));
 }
 
+/// Copy rendered chunks into the caller's buffer and report the geometry.
+///
+/// The tail shared by [`orender_process`] and [`orender_drain`]: both hand the
+/// engine's blocks straight out to the same caller-owned buffer under the same
+/// contract, and the only difference between them is where the blocks came
+/// from. Returns the value its callers return.
+///
+/// # Safety
+/// `out` must be non-null and valid for `out_cap_samples` floats; the three
+/// out-parameters are written only when non-null.
+unsafe fn emit_chunks(
+    engine: &mut Engine,
+    chunks: Vec<orender_engine::engine::RenderedAudio>,
+    out: *mut f32,
+    out_cap_samples: usize,
+    out_frames: *mut usize,
+    out_channels: *mut u32,
+    out_pts_us: *mut i64,
+) -> c_int {
+    let total_samples: usize = chunks.iter().map(|c| c.samples.len()).sum();
+    if total_samples > out_cap_samples {
+        if !out_frames.is_null() {
+            *out_frames = 0;
+        }
+        // Nothing was copied, but the buffers are still worth keeping: the
+        // caller is about to retry with a larger `out` and render again.
+        engine.recycle(chunks);
+        return 1; // buffer too small; caller retries larger
+    }
+
+    let out_slice = std::slice::from_raw_parts_mut(out, out_cap_samples);
+    let mut written = 0usize;
+    let mut total_frames = 0usize;
+    let mut n_channels = engine.channel_count();
+    let mut first_sample_pos: Option<u64> = None;
+    for chunk in &chunks {
+        // An output-mode switch can land between blocks of one packet; a
+        // mixed-layout copy would corrupt the frame geometry. Keep the
+        // call single-layout and drop the tail (sub-millisecond of audio,
+        // once per switch) — the next call carries the new layout.
+        if total_frames > 0 && chunk.n_channels != n_channels {
+            break;
+        }
+        out_slice[written..written + chunk.samples.len()].copy_from_slice(&chunk.samples);
+        written += chunk.samples.len();
+        total_frames += chunk.n_frames;
+        n_channels = chunk.n_channels;
+        first_sample_pos.get_or_insert(chunk.sample_pos);
+    }
+    // Copied out (or deliberately skipped, on a layout change): the sample
+    // buffers go back to the engine to be filled again next packet, instead
+    // of being freed and reallocated ~1200 times a second.
+    engine.recycle(chunks);
+
+    if !out_frames.is_null() {
+        *out_frames = total_frames;
+    }
+    if !out_channels.is_null() {
+        *out_channels = n_channels;
+    }
+    if !out_pts_us.is_null() {
+        let sr = engine.sample_rate().max(1) as i64;
+        *out_pts_us = first_sample_pos
+            .map(|p| (p as i64) * 1_000_000 / sr)
+            .unwrap_or(0);
+    }
+    0
+}
+
 /// Push one raw encoded packet and render whatever frames it yields.
 ///
 /// The caller owns `out` (capacity `out_cap_samples` floats). On success the
@@ -784,54 +860,70 @@ pub unsafe extern "C" fn orender_process(
             }
         };
 
-        let total_samples: usize = chunks.iter().map(|c| c.samples.len()).sum();
-        if total_samples > out_cap_samples {
-            if !out_frames.is_null() {
-                *out_frames = 0;
-            }
-            // Nothing was copied, but the buffers are still worth keeping: the
-            // caller is about to retry with a larger `out` and render again.
-            engine.recycle(chunks);
-            return 1; // buffer too small; caller retries larger
-        }
+        emit_chunks(
+            engine,
+            chunks,
+            out,
+            out_cap_samples,
+            out_frames,
+            out_channels,
+            out_pts_us,
+        )
+    }))
+    .unwrap_or(-100)
+}
 
-        let out_slice = std::slice::from_raw_parts_mut(out, out_cap_samples);
-        let mut written = 0usize;
-        let mut total_frames = 0usize;
-        let mut n_channels = engine.channel_count();
-        let mut first_sample_pos: Option<u64> = None;
-        for chunk in &chunks {
-            // An output-mode switch can land between blocks of one packet; a
-            // mixed-layout copy would corrupt the frame geometry. Keep the
-            // call single-layout and drop the tail (sub-millisecond of audio,
-            // once per switch) — the next call carries the new layout.
-            if total_frames > 0 && chunk.n_channels != n_channels {
-                break;
-            }
-            out_slice[written..written + chunk.samples.len()].copy_from_slice(&chunk.samples);
-            written += chunk.samples.len();
-            total_frames += chunk.n_frames;
-            n_channels = chunk.n_channels;
-            first_sample_pos.get_or_insert(chunk.sample_pos);
+/// Render whatever the decoder is still holding, at end of stream.
+///
+/// A bridge cannot always decide an access unit on arrival — an E-AC-3
+/// independent substream may be the first half of a presentation, and only the
+/// unit after it says whether it is — so one is held back when the input ends
+/// and no further [`orender_process`] call is coming to release it. Call this
+/// once, after the last packet, and play what it returns: for E-AC-3 that is
+/// the final 32 ms of the track, which is otherwise dropped.
+///
+/// Same output contract as [`orender_process`]: the caller owns `out`
+/// (capacity `out_cap_samples` floats), and `*out_frames` / `*out_channels` /
+/// `*out_pts_us` are set on success. Returns 0 = OK (may be 0 frames — nothing
+/// was held), >0 = output buffer too small (nothing written; retry larger),
+/// <0 = error.
+///
+/// Not a substitute for [`orender_reset`], and not to be called on a seek: a
+/// seek is meant to discard the audio it seeks away from, and this emits it.
+/// Idempotent — calling it twice, or on an idle engine, returns 0 frames — and
+/// the engine stays usable afterwards, so a host may drain and keep pushing.
+#[no_mangle]
+pub unsafe extern "C" fn orender_drain(
+    r: *mut OrenderRenderer,
+    out: *mut f32,
+    out_cap_samples: usize,
+    out_frames: *mut usize,
+    out_channels: *mut u32,
+    out_pts_us: *mut i64,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() || out.is_null() {
+            return -1;
         }
-        // Copied out (or deliberately skipped, on a layout change): the sample
-        // buffers go back to the engine to be filled again next packet, instead
-        // of being freed and reallocated ~1200 times a second.
-        engine.recycle(chunks);
+        let engine = &mut *(r as *mut Engine);
 
-        if !out_frames.is_null() {
-            *out_frames = total_frames;
-        }
-        if !out_channels.is_null() {
-            *out_channels = n_channels;
-        }
-        if !out_pts_us.is_null() {
-            let sr = engine.sample_rate().max(1) as i64;
-            *out_pts_us = first_sample_pos
-                .map(|p| (p as i64) * 1_000_000 / sr)
-                .unwrap_or(0);
-        }
-        0
+        let chunks = match engine.drain() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("orender_drain error: {e:#}");
+                return -2;
+            }
+        };
+
+        emit_chunks(
+            engine,
+            chunks,
+            out,
+            out_cap_samples,
+            out_frames,
+            out_channels,
+            out_pts_us,
+        )
     }))
     .unwrap_or(-100)
 }

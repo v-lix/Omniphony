@@ -893,6 +893,42 @@ impl Engine {
         self.process(data, RInputTransport::Raw, 0)
     }
 
+    /// Render whatever the bridge is still holding, because the stream is over.
+    ///
+    /// A bridge that buffers an access unit to see what follows it is holding
+    /// one when the input ends, and no further [`process`](Self::process) call
+    /// is coming to release it. The host calls this once at end of stream and
+    /// plays what comes back; for E-AC-3 that is the final 32 ms of the track,
+    /// which was previously dropped with the bridge's pending state.
+    ///
+    /// Not a [`reset`](Self::reset): the renderer keeps its per-object and ramp
+    /// state, because these frames are the continuation of the ones before them
+    /// and resetting first would fade them in from nothing. Safe to call on an
+    /// idle engine, and safe to call twice — the second returns nothing.
+    pub fn drain(&mut self) -> Result<Vec<RenderedAudio>> {
+        let decode_started = std::time::Instant::now();
+        let result = self.bridge.bridge.drain();
+        let decode_time_ms = decode_started.elapsed().as_secs_f32() * 1000.0;
+
+        if !result.error_message.is_empty() {
+            bail!("bridge drain error: {}", result.error_message);
+        }
+
+        let per_frame_decode_time_ms = if result.frames.is_empty() {
+            decode_time_ms
+        } else {
+            decode_time_ms / result.frames.len() as f32
+        };
+
+        let mut out = Vec::with_capacity(result.frames.len());
+        for frame in result.frames.iter() {
+            if let Some(chunk) = self.render_frame(frame, per_frame_decode_time_ms)? {
+                out.push(chunk);
+            }
+        }
+        Ok(out)
+    }
+
     /// Hand the sample buffers of a consumed [`process`](Self::process) result
     /// back for reuse.
     ///
