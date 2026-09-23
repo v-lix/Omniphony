@@ -8,7 +8,7 @@ use abi_stable::{prefix_type::PrefixTypeTrait, sabi_trait::prelude::TD_Opaque};
 use bridge_api::*;
 use orender::{
     OrenderRenderer, orender_channel_count, orender_decoded_sample_rate, orender_drain,
-    orender_process, orender_reset,
+    orender_hrir_in_use, orender_process, orender_reset,
 };
 use orender_engine::Engine;
 use orender_engine::bridge_loader::LoadedBridge;
@@ -265,5 +265,26 @@ fn reset_discards_pending_tail_and_drain_reports_decoder_errors() {
             ),
             -2
         );
+    }
+}
+
+#[test]
+fn hrir_in_use_names_the_convolved_set_with_the_label_convention() {
+    let mut engine = engine();
+    let r = (&mut *engine as *mut Engine).cast::<OrenderRenderer>();
+    unsafe {
+        assert_eq!(orender_hrir_in_use(ptr::null(), ptr::null_mut(), 0), 0);
+
+        // Nothing configured: the embedded KEMAR set the engine starts with.
+        let n = orender_hrir_in_use(r, ptr::null_mut(), 0);
+        assert_eq!(n, 3);
+
+        // cap == N writes nothing; cap > N writes the name and its NUL.
+        let mut buf = [0x7f as std::os::raw::c_char; 8];
+        assert_eq!(orender_hrir_in_use(r, buf.as_mut_ptr(), n), n);
+        assert!(buf.iter().all(|&c| c == 0x7f));
+        assert_eq!(orender_hrir_in_use(r, buf.as_mut_ptr(), n + 1), n);
+        let name = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap();
+        assert_eq!(name, "saf");
     }
 }
