@@ -73,6 +73,14 @@ handle. It survives a same-stream seek and updates with each decoded frame;
 it is not the configured renderer rate. Hosts poll it to detect when the
 renderer must be reopened at the source rate. Probe the symbol, not minor 10.
 
+`orender_hrir_in_use` names the HRIR set the binaural path is convolving
+with, using the `hrir_source` selectors (`saf`, `sofa`, `brir`, ...), with the
+`orender_source_label` query/fill convention. It reports the set in use, not
+the one configured: a SOFA file that failed to load reads as `saf`. A
+configured set is requested with the first rendered block and built off the
+audio thread, so the answer is live and can change shortly after a stream
+starts.
+
 The Rust plugin interface remains `bridge_api` 0.4; its package version is
 independent of the C ABI minor. Rebuild the matching renderer and plugins.
 

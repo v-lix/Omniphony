@@ -698,6 +698,14 @@ impl Engine {
         self.decoded_sample_rate
     }
 
+    /// The binaural HRIR build status: the set asked for, the set the grid
+    /// actually holds, and why they differ when a SOFA file failed to load.
+    /// Follows the rebuild worker, so it moves from the initial KEMAR set to a
+    /// configured one once that build lands (after the first rendered block).
+    pub fn hrir_status(&self) -> std::sync::Arc<renderer::binaural::HrirStatus> {
+        self.renderer.renderer_control().binaural_hrir_status()
+    }
+
     /// Reset the session after a seek or stream discontinuity. Flushes the
     /// bridge pipeline and the renderer's per-object/ramp state, and clears the
     /// per-stream spatial state. Live parameters (gains, layout, OSC-applied
