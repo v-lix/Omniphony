@@ -178,6 +178,21 @@ uint32_t orender_bed_layout(const struct OrenderRenderer *r, uint8_t *out_labels
 // NULL handle / error.
 uint32_t orender_source_label(const struct OrenderRenderer *r, char *out, uint32_t cap);
 
+// Write the selector of the HRIR set the binaural renderer is convolving
+// with — `saf` (the embedded KEMAR set), `sofa`, `brir`, `synthetic`,
+// `pinna` or `prtf`, the same words `hrir_source` takes in the config — as a
+// NUL-terminated string. It names the set in use, not the one configured: a
+// SOFA file that could not be loaded reports `saf`, the set the build fell
+// back to. Live: a configured set is requested with the first rendered block
+// and built off the audio thread, so the answer can move from `saf` to
+// `sofa` a moment into the stream; poll it with the other per-frame queries
+// rather than latching the first value.
+//
+// Query/fill convention as [`orender_source_label`]: returns the length `N`
+// without the terminator and writes only when `out` is non-NULL and
+// `cap > N`. 0 on a NULL handle / error.
+uint32_t orender_hrir_in_use(const struct OrenderRenderer *r, char *out, uint32_t cap);
+
 // Constant DSP latency of the rendered output, in samples at the engine
 // sample rate: PCM fed to [`orender_process`] emerges this many samples later
 // in the rendered stream. 0 for the default filters; non-zero when the
