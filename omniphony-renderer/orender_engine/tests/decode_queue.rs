@@ -509,3 +509,22 @@ fn a_host_that_forces_the_thread_ignores_the_option() {
         "live mode picks the option up at once"
     );
 }
+
+/// A managed host's clients may not change the thread it forces, so the live
+/// option shows what it forced; an engine nobody manages keeps the user's.
+#[test]
+fn a_managed_host_shows_the_thread_it_forced() {
+    let (mut engine, _, control) = engine_with_control();
+    control.set_managed_host(Some("kodi".into()));
+    engine.set_decode_thread(true).unwrap();
+    assert!(control.live.read().decode_thread, "on as forced");
+    engine.set_decode_thread(false).unwrap();
+    assert!(!control.live.read().decode_thread, "off as forced");
+
+    let (mut engine, _, control) = engine_with_control();
+    engine.set_decode_thread(true).unwrap();
+    assert!(
+        !control.live.read().decode_thread,
+        "the preference stays the user's"
+    );
+}

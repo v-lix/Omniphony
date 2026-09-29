@@ -1668,6 +1668,17 @@ pub struct RendererControl {
     /// next to the build fingerprint.
     pub host_abi: Mutex<Option<(u32, u32)>>,
 
+    /// The application that owns this engine and its config
+    /// (`render.managed_host`), set once at construction. `None` for an engine
+    /// that owns itself. While set, live edits are never written anywhere and
+    /// the OSC surface refuses what would break the host or reach past it.
+    managed_host: Mutex<Option<String>>,
+
+    /// The HRIR source the managed host's config chose, as seeded at
+    /// construction, so a client that moves away from it can still come back
+    /// to it. `None` without a managed host.
+    host_hrir_source: Mutex<Option<crate::binaural::HrirSource>>,
+
     /// Facts about the crossover bank the speaker stage actually built
     /// (engine, bands, cutoffs, taps, latency). Written by the render thread
     /// on every bank (re)build, broadcast in the `/state/renderer` snapshot so
@@ -1793,6 +1804,8 @@ impl RendererControl {
             config_status: Mutex::new(None),
             bridge_error: Mutex::new(None),
             host_abi: Mutex::new(None),
+            managed_host: Mutex::new(None),
+            host_hrir_source: Mutex::new(None),
             crossover_info: Mutex::new(None),
             input_path: Mutex::new(None),
             bridge_path: Mutex::new(None),
@@ -2214,6 +2227,51 @@ impl RendererControl {
 
     pub fn host_abi(&self) -> Option<(u32, u32)> {
         *self.host_abi.lock()
+    }
+
+    /// Record the application that owns this engine (`render.managed_host`,
+    /// see [`crate::config::RenderConfig::managed_host`]).
+    pub fn set_managed_host(&self, host: Option<String>) {
+        *self.managed_host.lock() = host;
+    }
+
+    /// The application that owns this engine and its config, if any.
+    pub fn managed_host(&self) -> Option<String> {
+        self.managed_host.lock().clone()
+    }
+
+    /// Whether an application owns this engine and its config.
+    pub fn is_managed(&self) -> bool {
+        self.managed_host.lock().is_some()
+    }
+
+    /// Record the HRIR source the managed host's config chose.
+    pub fn set_host_hrir_source(&self, source: Option<crate::binaural::HrirSource>) {
+        *self.host_hrir_source.lock() = source;
+    }
+
+    /// The HRIR source the managed host's config chose, if recorded.
+    pub fn host_hrir_source(&self) -> Option<crate::binaural::HrirSource> {
+        self.host_hrir_source.lock().clone()
+    }
+
+    /// Whether `key` is a filesystem parameter (`Path` or `File`) of the
+    /// registered backend `backend_id`, going by its static schema. Unknown
+    /// backends and keys are not.
+    pub fn is_backend_path_param(&self, backend_id: &str, key: &str) -> bool {
+        self.backend_registry
+            .read()
+            .get(backend_id)
+            .is_some_and(|factory| {
+                factory.param_schema().iter().any(|spec| {
+                    spec.key == key
+                        && matches!(
+                            spec.kind,
+                            crate::backend_params::ParamKind::Path
+                                | crate::backend_params::ParamKind::File { .. }
+                        )
+                })
+            })
     }
 
     pub fn active_topology(&self) -> Arc<RenderTopology> {

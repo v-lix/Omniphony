@@ -62,6 +62,7 @@ not know that key" — treat it as feature-unavailable, not as an error.
 | Key | Values | Since | Meaning |
 |---|---|---|---|
 | `decode_thread` | `on`, `off` (default), `live` (0.11) | 0.10 | Decode on a thread of its own, overlapping the render, so the two share the work across two cores. A packet's audio then comes back from a later `orender_process` call — one packet's per call, about 30 ms of audio behind, or one packet if that is longer; occasionally two while the queue shrinks, so size the buffer for two — or from `orender_drain`, so only a host that takes its timestamps from what the call returns (see [Output timestamps](#output-timestamps)) and drains at end of stream should turn it on. `on`/`off` force it: switch them while nothing is in flight — right after `orender_create`, after `orender_reset`, or once `orender_drain` has returned 0 frames; turning it off with packets still on the thread returns -2. `live` hands the choice to the user's `render.decode_thread` option (config.yaml, Studio, OSC); the engine follows it at packet boundaries, and when it is turned off mid-stream the thread winds down a packet per call before decoding goes back inline. |
+| `heard_us` | a decimal integer | 0.12 | Where the listener is, in the microseconds `*out_pts_us` counts (see [Output timestamps](#output-timestamps)), so from 0 after `orender_reset`. From the first report on, what OSC clients are told about each block — the spatial frame and its objects, the timestamp, the meters — is held until the listener reaches that block, so a client such as Studio shows what is being heard rather than what was just rendered for a buffer ahead of it. Report `0` right after `orender_create` to hold from the first block, then report as the audio plays; `orender_reset` rewinds it to 0 and drops what is held. A host that never sets it gets them as it renders. What is held is bounded: past a few megabytes the oldest goes out early. |
 
 ## Output timestamps
 
@@ -119,6 +120,12 @@ the one configured: a SOFA file that failed to load reads as `saf`. A
 configured set is requested with the first rendered block and built off the
 audio thread, so the answer is live and can change shortly after a stream
 starts.
+
+The fork also adds the `heard_us` option (see Options). Kodi buffers what it
+is handed - the codec's reserve, then its audio engine and sink - so the
+render runs up to two seconds or more ahead of what is heard, and Studio drew
+the objects that far early; the codec reports the position the sink is playing
+through its helper instead. Probe the key, not minor 12.
 
 The Rust plugin interface remains `bridge_api` 0.4; its package version is
 independent of the C ABI minor. Rebuild the matching renderer and plugins.

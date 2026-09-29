@@ -472,6 +472,15 @@ const char *orender_build_id(void);
 //   `render.decode_thread` option (config.yaml, Studio, OSC), which the
 //   engine then follows at packet boundaries, winding the thread down a
 //   packet per call when it is turned off mid-stream.
+// - `heard_us` = a decimal integer (ABI 0.12): where the listener is, in the
+//   microseconds `*out_pts_us` counts - so from 0 after `orender_reset`. A
+//   host that buffers the rendered audio plays it later than it is rendered;
+//   from its first report on, what OSC clients are told about each block (the
+//   spatial frame and its objects, the timestamp, the meters) is held until
+//   the listener reaches that block, so a client such as Studio shows what is
+//   being heard rather than what was just rendered. Report it as the audio
+//   plays, and `0` right after `orender_create` to hold from the first block.
+//   A host that never sets it gets them as it renders.
 int orender_set_option(struct OrenderRenderer *r, const char *key, const char *value);
 
 #ifdef __cplusplus

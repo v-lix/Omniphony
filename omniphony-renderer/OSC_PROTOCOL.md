@@ -21,7 +21,47 @@ and compatible metadata producers such as `adm-player`.
 | `--osc-rx-port` | `9000` | `orender` receive port for registration and control |
 
 The fixed client defined by `--osc-host:--osc-port` always receives broadcasts.
-Additional clients can register dynamically.
+Additional clients can register dynamically. Port `0` (`render.osc_port: 0`)
+means no fixed client: nothing is sent until a client registers.
+
+## Managed hosts
+
+`render.managed_host: <name>` declares that an application owns the engine and
+writes its config for every stream — the Kodi fork sets `kodi`. Such an engine:
+
+- reports `<name>` as `host` in `/omniphony/state/capabilities` (the
+  `variant` is unchanged, so clients behave as for any embedded host);
+- keeps live edits for the current stream only: nothing is saved, written
+  back to the config (view state such as the monitoring cadences and the head
+  recenter included), or handed to the next instance, overlay display
+  preferences are neither read nor written, and a leftover live-handoff sidecar
+  next to the config is deleted unapplied;
+- refuses a change to the `output_mode`, `binaural_mode` and `decode_thread`
+  options and a FIR `crossover_type`, under any spelling the option takes,
+  whether sent to the option's own address, through `/omniphony/control/option`
+  or in a `/omniphony/control/options` batch (a whole batch is refused for one
+  such pair; a pair that leaves the option as it is goes through);
+  `save_config`, `reload_config`, `restart`, `quit`, `profile/*`,
+  `layout/export`, `backend/file/put` and `binaural/hrtf_upload/*`;
+  `render/bridge_path` and `render/input_pipe`; `speaker_test*` and
+  `object_test*`; a `backend/param` setting a backend's `Path` or `File`
+  parameter (names trimmed, a blank backend meaning the active one, as the
+  setter reads them); and an `hrir_source` naming a `sofa:`/`brir:` file other
+  than the one in use or the one the host's config chose, by any of the same
+  routes. A bare `sofa` means the host's SOFA file when it has one;
+- reports the decode thread the host forced (`orender_set_option`
+  `decode_thread` `on`/`off`) as the live `decode_thread` option, since its
+  clients cannot change it;
+- answers each refusal with a warning in the log stream, a fresh state
+  broadcast so the client shows what holds, and then
+  `/omniphony/state/config/save_error s "Not changed: <Name> manages <what>"`,
+  the reason a client shows by its save indicator until the next state
+  update;
+- never makes the host wait for `--osc-rx-port`. A host may open a successor
+  before it closes the engine it replaces, in another process that neither
+  yields nor releases the port until that open returns. The successor starts
+  at once without a listener and takes the port within 250 ms of it freeing;
+  registered clients re-register as usual.
 
 ## Registration
 
@@ -67,6 +107,13 @@ Serialized JSON layout snapshot with speaker geometry and static metadata.
 Serialized JSON speaker runtime/config snapshot with per-speaker `gain`, `delayMs`, and `muted`.
 
 ### Spatial Metadata
+
+These, `/omniphony/timestamp` and the meter bundles describe a block of audio
+and are sent as it is rendered. An embedded host that says where its listener
+is (`orender_set_option` `heard_us`, see ABI.md) has them held until the
+listener reaches the block instead, in order: Kodi buffers up to two seconds
+or more of rendered audio, which a client would otherwise show that far ahead
+of the sound.
 
 #### `/omniphony/spatial/frame`
 

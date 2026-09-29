@@ -380,7 +380,17 @@ impl Engine {
             sender.set_default_metering(true);
         }
         sender.attach_renderer_control(self.renderer.renderer_control());
-        sender.start_listener(opts.port_in, true)?;
+        if self.renderer.renderer_control().is_managed() {
+            // A managed host may open this engine before it closes the one this
+            // replaces - Kodi does on an audio-track change, and there the two
+            // are separate processes, so neither the in-process release nor the
+            // yield reaches the old one. It frees the port as it exits, which
+            // is after this open returns: waiting here would only stall the
+            // host. Take the port when it frees instead.
+            sender.start_listener_when_free(opts.port_in)?;
+        } else {
+            sender.start_listener(opts.port_in, true)?;
+        }
         // Meter cadence reads the RendererControl atomic each poll (source of
         // truth, OSC-adjustable, persisted).
         self.audio_meter = Some(AudioMeter::new_with_rate_atomic(
@@ -514,14 +524,29 @@ impl Engine {
         if live_restored {
             control.mark_dirty();
         }
+        control.set_managed_host(
+            render_cfg
+                .as_ref()
+                .and_then(|c| c.managed_host())
+                .map(str::to_string),
+        );
+        // The source the host's config chose, seeded above: a client may leave
+        // it and come back to it (`osc::dispatch::managed_host_refusal`).
+        if control.is_managed() {
+            let seeded = control.live.read().binaural.hrir_source.clone();
+            control.set_host_hrir_source(Some(seeded));
+        }
 
         // Overlay display prefs (enable / labels / trails) are owned and
         // persisted by orender now, in a small dedicated file next to the
         // config — loaded here at startup and auto-saved on each live change.
         // Deliberately NOT part of the savable config (no mark_dirty / save).
+        // Not for a managed host, which draws no overlay and whose directory
+        // this engine writes nothing into.
         let overlay_prefs = config_yaml_path
             .map(Path::to_path_buf)
             .or_else(crate::default_config_path)
+            .filter(|_| !control.is_managed())
             .and_then(|p| p.parent().map(|d| d.join("overlay-prefs.conf")));
         if let Some(p) = overlay_prefs {
             overlay::load_prefs(&p);
@@ -703,6 +728,23 @@ impl Engine {
         self.sample_rate
     }
 
+    /// Where the listener is: `us` microseconds into the stream, counted as
+    /// the timestamps this engine hands back are (`*out_pts_us`), so from 0
+    /// after [`reset`](Self::reset). A host that buffers the rendered audio
+    /// plays it later than it is rendered, and from its first report on, what
+    /// OSC clients are told about each block - the spatial frame and its
+    /// objects, the timestamp, the meters - is held until the listener reaches
+    /// that block. A host that never reports gets it as it is rendered.
+    pub fn set_heard_us(&mut self, us: i64) {
+        let rate = i128::from(self.sample_rate.max(1));
+        // Rounded up: the timestamps are rounded down, so a block's own start
+        // comes back to exactly its position rather than a sample short of it.
+        let pos = (i128::from(us.max(0)) * rate + 999_999) / 1_000_000;
+        if let Some(osc) = self.osc.as_ref() {
+            osc.heard(u64::try_from(pos).unwrap_or(u64::MAX));
+        }
+    }
+
     /// Last decoder output rate in Hz, not the session rate the host
     /// configured; the renderer follows it, so it is the rate of the audio
     /// returned. Zero means no rate has been reported. The host can use a
@@ -754,9 +796,11 @@ impl Engine {
         self.reset_segment_state();
         // Object frames are delta-encoded; after a seek the (static) virtual-bed
         // poses would never be re-sent, so force a full re-emit of object
-        // positions + names on the next frame.
+        // positions + names on the next frame. What is still held for a
+        // listener who will now never reach it goes with the old positions.
         if let Some(osc) = self.osc.as_mut() {
             osc.request_full_object_resend();
+            osc.rewind_playout();
         }
         self.decoded_samples = 0;
         self.stream.drc = Default::default();
@@ -1059,6 +1103,18 @@ impl Engine {
         } else {
             DecodeThreadMode::Off
         };
+        // A managed host's clients may not change what it forced, so the live
+        // option they are shown carries it rather than a preference nothing
+        // follows. Such a host never saves the option, so this goes no further.
+        let control = self.renderer.renderer_control();
+        if control.is_managed() {
+            let was = std::mem::replace(&mut control.live.write().decode_thread, on);
+            if was != on {
+                if let Some(Err(e)) = self.osc.as_ref().map(|osc| osc.send_live_state_bundle()) {
+                    log::warn!("decode thread state not sent to OSC clients: {e:#}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1250,6 +1306,10 @@ impl Engine {
         // above is only for calculations that must not divide by zero.
         self.decoded_sample_rate = frame.sampling_frequency;
         let sample_pos_at_start = self.decoded_samples;
+        // Everything sent while rendering this frame describes it.
+        if let Some(osc) = self.osc.as_ref() {
+            osc.render_at(sample_pos_at_start);
+        }
         render::follow_stream_rate(&mut self.renderer, frame.sampling_frequency)?;
 
         let want_osc = self.osc.as_ref().is_some_and(|o| o.has_osc_clients());

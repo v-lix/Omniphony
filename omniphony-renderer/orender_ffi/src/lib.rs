@@ -208,8 +208,11 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     the last call returned); orender_process now reads its pts_us argument.
 // 12: fork additions: orender_decoded_sample_rate, the bridge's actual output
 //     rate so a host can detect a mismatch with its configured session rate;
-//     orender_drain releasing a pending decoder access unit at EOF too; and
-//     orender_hrir_in_use to name the HRIR set the binaural path convolves.
+//     orender_drain releasing a pending decoder access unit at EOF too;
+//     orender_hrir_in_use to name the HRIR set the binaural path convolves;
+//     and the `heard_us` key of orender_set_option (where the listener is, so
+//     OSC clients are told about each block as it is heard rather than as it
+//     is rendered).
 pub const ORENDER_ABI_MINOR: u32 = 12;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -329,10 +332,19 @@ fn build_engine(cfg: &OrenderConfig) -> Result<Engine> {
         config_bridge.as_deref(),
     )
     .is_ok();
+    // A managed host (Kodi) skips the negotiation. It may open this engine
+    // while the one it replaces still holds the port, in another process that
+    // neither yields nor releases it until this open has returned, so the
+    // negotiation could only spend its whole budget. There is no sidecar to
+    // settle either - a managed engine never writes one - and the listener
+    // takes the port once it frees (`Engine::enable_osc`).
+    let managed = render_cfg
+        .as_ref()
+        .is_some_and(|c| c.managed_host().is_some());
     if bridge_resolvable {
         // A same-process degraded reporter may itself hold the port.
         stop_degraded_reporter_global();
-        if let Some(opts) = osc_opts.as_ref()
+        if let Some(opts) = osc_opts.as_ref().filter(|_| !managed)
             && !orender_engine::osc::negotiate_rx_port(opts.port_in)
         {
             log::warn!(
@@ -1486,6 +1498,15 @@ pub extern "C" fn orender_build_id() -> *const c_char {
 ///   `render.decode_thread` option (config.yaml, Studio, OSC), which the
 ///   engine then follows at packet boundaries, winding the thread down a
 ///   packet per call when it is turned off mid-stream.
+/// - `heard_us` = a decimal integer (ABI 0.12): where the listener is, in the
+///   microseconds `*out_pts_us` counts - so from 0 after `orender_reset`. A
+///   host that buffers the rendered audio plays it later than it is rendered;
+///   from its first report on, what OSC clients are told about each block (the
+///   spatial frame and its objects, the timestamp, the meters) is held until
+///   the listener reaches that block, so a client such as Studio shows what is
+///   being heard rather than what was just rendered. Report it as the audio
+///   plays, and `0` right after `orender_create` to hold from the first block.
+///   A host that never sets it gets them as it renders.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn orender_set_option(
     r: *mut OrenderRenderer,
@@ -1518,6 +1539,13 @@ pub unsafe extern "C" fn orender_set_option(
                     }
                 }
             }
+            "heard_us" => match value.trim().parse::<i64>() {
+                Ok(us) => {
+                    engine.set_heard_us(us);
+                    0
+                }
+                Err(_) => -2,
+            },
             _ => -1,
         }
     }))
