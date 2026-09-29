@@ -622,3 +622,22 @@ fn heard_us_publishes_the_listener_and_marks_each_block() {
         .and_then(|m| long_arg(m, 0));
     assert!(first.is_some_and(|pos| pos < 4 * 1536), "{first:?}");
 }
+
+/// A managed host's clients may not change the thread it forces, so the live
+/// option shows what it forced; an engine nobody manages keeps the user's.
+#[test]
+fn a_managed_host_shows_the_thread_it_forced() {
+    let (mut engine, _, control) = engine_with_control();
+    control.set_managed_host(Some("kodi".into()));
+    engine.set_decode_thread(true).unwrap();
+    assert!(control.live.read().decode_thread, "on as forced");
+    engine.set_decode_thread(false).unwrap();
+    assert!(!control.live.read().decode_thread, "off as forced");
+
+    let (mut engine, _, control) = engine_with_control();
+    engine.set_decode_thread(true).unwrap();
+    assert!(
+        !control.live.read().decode_thread,
+        "the preference stays the user's"
+    );
+}

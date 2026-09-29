@@ -6,6 +6,7 @@ use std::sync::Arc;
 use renderer::backend_files;
 use renderer::backend_params::ParamValue;
 use renderer::live_params::RendererControl;
+use renderer::options::OptionSpec;
 use rosc::{OscMessage, OscType};
 use runtime_control::HostControlHandler;
 use runtime_control::command::{RuntimeCommand, parse_process_command};
@@ -16,6 +17,7 @@ use runtime_control::osc::{
 };
 use runtime_control::osc::{
     parse_bool_arg, parse_f32_arg, parse_nonnegative_u32_arg, parse_positive_u32_arg,
+    parse_string_arg,
 };
 use runtime_control::osc_contract;
 
@@ -47,6 +49,63 @@ pub(crate) fn handle_control_message(
 ) {
     let addr = msg.addr.as_str();
     let runtime_ctx = RuntimeControlContext::new(Arc::clone(control));
+
+    // A managed host owns this engine's config, output and process; see
+    // `managed_host_refusal`. The client that sent the refused change may
+    // already show it, so everyone gets the state that actually holds, and
+    // then the reason, as a config save error: the one message upstream Studio
+    // shows in plain view, in red by its Save indicator, until the next state
+    // update clears it - which is why it goes after the state, not before. An
+    // upload's chunks are refused quietly: the begin was already refused and
+    // said so, and a file arrives in hundreds of them.
+    let rewritten;
+    let msg = match managed_host_rewrite(msg, control.host_hrir_source().as_ref()) {
+        Some(message) => {
+            rewritten = message;
+            &rewritten
+        }
+        None => msg,
+    };
+    if let Some(manager) = control.managed_host() {
+        let refusal = {
+            let (output_mode, binaural_mode, decode_thread, current_hrir, active_backend) = {
+                let live = control.live.read();
+                (
+                    live.binaural.output_mode,
+                    live.binaural.mode,
+                    live.decode_thread,
+                    live.binaural.hrir_source.clone(),
+                    live.backend_id().to_string(),
+                )
+            };
+            let host_hrir = control.host_hrir_source();
+            let state = ManagedState {
+                output_mode,
+                binaural_mode,
+                decode_thread,
+                hrir: &current_hrir,
+                host_hrir: host_hrir.as_ref(),
+            };
+            managed_host_refusal(msg, &state, |backend, key| {
+                control.is_backend_path_param(backend.unwrap_or(&active_backend), key)
+            })
+        };
+        if let Some(what) = refusal {
+            if addr == osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_CHUNK {
+                log::debug!("OSC {addr} refused: {manager} manages {what}");
+            } else {
+                log::warn!("OSC {addr} refused: {manager} manages {what}");
+                build_live_state(control, host).broadcast(socket, clients);
+                broadcast_string(
+                    socket,
+                    clients,
+                    osc_contract::STATE_CONFIG_SAVE_ERROR,
+                    &managed_host_refusal_notice(&manager, what),
+                );
+            }
+            return;
+        }
+    }
 
     // Pure live-state writes (declared live options, monitoring cadences,
     // generator/phantom params, placement): validated and applied by the core;
@@ -551,6 +610,217 @@ pub(crate) fn handle_control_message(
         export_current_layout(control, requested_name);
         return;
     }
+}
+
+/// What a managed host keeps, as [`managed_host_refusal`] compares a write
+/// against it.
+pub(crate) struct ManagedState<'a> {
+    pub output_mode: renderer::live_params::OutputMode,
+    pub binaural_mode: renderer::live_params::BinauralMode,
+    pub decode_thread: bool,
+    /// The HRIR source in use.
+    pub hrir: &'a renderer::binaural::HrirSource,
+    /// The one the host's config chose.
+    pub host_hrir: Option<&'a renderer::binaural::HrirSource>,
+}
+
+/// What an engine with a managed host (`render.managed_host`: Kodi) will not
+/// let a client change, named for the log, or `None` for a message it acts on.
+///
+/// The host writes the whole config for every stream and reads back only
+/// stereo: its helper frames each block as two channels and ends the stream on
+/// anything else, so the output mode stays. The binaural render mode stays
+/// too: the host moves a stream to the cascade when it carries more objects
+/// than direct rendering can keep up with, and switching back would undo that.
+/// A FIR crossover delays the sound by its latency, which the host does not
+/// take off its timestamps, so only the zero-latency LR4 is accepted. The
+/// decode thread is the host's to force, and the live option only matters
+/// where it does not. These are registry options, reached by their own
+/// addresses, `/control/option` and the batch `/control/options` alike, so
+/// they are judged by key, as the registry reads each value; a write that
+/// leaves one as it is goes through. Saving, profiles, layout export, backend
+/// file writes and HRTF uploads would write into the host's directory on the
+/// device; quitting, reloading, restarting, and a new bridge or input pipe
+/// belong to the host's process. Test signals would play into whatever is
+/// showing. A file-backed HRIR source or a backend's path parameter reads a
+/// path the host did not choose: the HRIR source already in use, or the one
+/// the host configured, may still be sent. `is_path_param(backend, key)`
+/// answers for a backend's schema, `None` meaning the active backend. Every
+/// other control is live and lasts until the host's next stream.
+pub(crate) fn managed_host_refusal(
+    msg: &OscMessage,
+    state: &ManagedState,
+    is_path_param: impl Fn(Option<&str>, &str) -> bool,
+) -> Option<&'static str> {
+    if let Some(what) = option_writes(msg)
+        .into_iter()
+        .find_map(|(spec, value)| managed_option_refusal(spec, &msg.args[value], state))
+    {
+        return Some(what);
+    }
+    match msg.addr.as_str() {
+        osc_contract::CONTROL_BACKEND_PARAM => {
+            // `[backend, key, value]`, or `[key, value]` for the active backend,
+            // read as the handler reads them: trimmed, a blank backend meaning
+            // the active one.
+            let (backend, key) = if msg.args.len() >= 3 {
+                (
+                    parse_string_arg(msg.args.first()),
+                    parse_string_arg(msg.args.get(1)),
+                )
+            } else {
+                (None, parse_string_arg(msg.args.first()))
+            };
+            key.filter(|key| is_path_param(backend.as_deref(), key))
+                .map(|_| "which files are read")
+        }
+        osc_contract::CONTROL_SAVE_CONFIG
+        | osc_contract::CONTROL_PROFILE_SWITCH
+        | osc_contract::CONTROL_PROFILE_CREATE
+        | osc_contract::CONTROL_PROFILE_DELETE
+        | osc_contract::CONTROL_PROFILE_RENAME
+        | osc_contract::CONTROL_LAYOUT_EXPORT
+        | osc_contract::CONTROL_BACKEND_FILE_PUT
+        | osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_BEGIN
+        | osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_CHUNK
+        | osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_END => {
+            Some("the configuration and the files on the device")
+        }
+        osc_contract::CONTROL_QUIT
+        | osc_contract::CONTROL_RELOAD_CONFIG
+        | osc_contract::CONTROL_RESTART
+        | osc_contract::CONTROL_RENDER_BRIDGE_PATH
+        | osc_contract::CONTROL_RENDER_INPUT_PIPE => Some("the engine's process and its decoder"),
+        osc_contract::CONTROL_SPEAKER_TEST
+        | osc_contract::CONTROL_SPEAKER_TEST_IDLE_FEED
+        | osc_contract::CONTROL_OBJECT_TEST
+        | osc_contract::CONTROL_OBJECT_TEST_CLIP
+        | osc_contract::CONTROL_OBJECT_TEST_ROTATION => Some("what plays"),
+        _ => None,
+    }
+}
+
+/// The registry option writes `msg` carries, however it sends them - one pair
+/// on `/control/option`, several on `/control/options`, or an option's own
+/// address - as the registry reads them: the option, and where its value is in
+/// `msg.args`. Empty for any other message, and for a batch the registry
+/// refuses whole (an unknown key, a missing value).
+fn option_writes(msg: &OscMessage) -> Vec<(&'static OptionSpec, std::ops::Range<usize>)> {
+    let addr = msg.addr.as_str();
+    if let Some(spec) = renderer::options::find_by_legacy_addr(addr) {
+        let arity = spec.kind.arity();
+        return if msg.args.len() >= arity {
+            vec![(spec, 0..arity)]
+        } else {
+            Vec::new()
+        };
+    }
+    let single = addr == osc_contract::CONTROL_OPTION;
+    if !single && addr != osc_contract::CONTROL_OPTIONS {
+        return Vec::new();
+    }
+    let mut writes = Vec::new();
+    let mut at = 0;
+    while let Some(key) = msg.args.get(at) {
+        let OscType::String(key) = key else {
+            return Vec::new();
+        };
+        let Some(spec) = renderer::options::find(key) else {
+            return Vec::new();
+        };
+        let value = at + 1..at + 1 + spec.kind.arity();
+        if value.end > msg.args.len() {
+            return Vec::new();
+        }
+        at = value.end;
+        writes.push((spec, value));
+        if single {
+            break;
+        }
+    }
+    writes
+}
+
+/// One registry write, judged as [`managed_host_refusal`] describes, with the
+/// value read the way the option's own setter reads it - so every spelling it
+/// takes (FIR as `linear_phase`, the output as `speakers`) is caught, and a
+/// value it would reject is left for it to reject.
+fn managed_option_refusal(
+    spec: &OptionSpec,
+    args: &[OscType],
+    state: &ManagedState,
+) -> Option<&'static str> {
+    use renderer::binaural::HrirSource;
+    use renderer::live_params::{BinauralMode, CrossoverType, OutputMode};
+    use renderer::options::{raw_bool, raw_str};
+    let value = runtime_control::live_control::WireValue::from_args(spec.kind, args);
+    let raw = value.raw()?;
+    match spec.key {
+        "output_mode" => OutputMode::from_str(raw_str(&raw)?)
+            .filter(|mode| *mode != state.output_mode)
+            .map(|_| "the output format"),
+        "binaural_mode" => BinauralMode::from_str(raw_str(&raw)?)
+            .filter(|mode| *mode != state.binaural_mode)
+            .map(|_| "the render mode (direct or cascaded)"),
+        "decode_thread" => raw_bool(&raw)
+            .filter(|on| *on != state.decode_thread)
+            .map(|_| "the decode thread"),
+        "crossover_type" => (CrossoverType::from_str(raw_str(&raw)?) == Some(CrossoverType::Fir))
+            .then_some("the crossover: FIR would put the sound behind the picture"),
+        "hrir_source" => {
+            let requested = HrirSource::from_str(raw_str(&raw)?)?;
+            match &requested {
+                HrirSource::Sofa(path) | HrirSource::Brir(path)
+                    if !path.trim().is_empty()
+                        && &requested != state.hrir
+                        && Some(&requested) != state.host_hrir =>
+                {
+                    Some("which files are read")
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A managed host's SOFA file for a client's bare `sofa`, by whichever route
+/// the HRIR source is sent. Studio's source list sends the bare name, which the
+/// live control would take as a SOFA with no file - the built-in set - where
+/// the config's `sofa` means the host's own file. `None` leaves the message as
+/// it is.
+pub(crate) fn managed_host_rewrite(
+    msg: &OscMessage,
+    host_hrir: Option<&renderer::binaural::HrirSource>,
+) -> Option<OscMessage> {
+    use renderer::binaural::HrirSource;
+    let Some(HrirSource::Sofa(path)) = host_hrir else {
+        return None;
+    };
+    if path.trim().is_empty() {
+        return None;
+    }
+    let mut rewritten: Option<OscMessage> = None;
+    for (spec, value) in option_writes(msg) {
+        let bare = matches!(msg.args.get(value.start), Some(OscType::String(s))
+            if HrirSource::from_str(s) == Some(HrirSource::Sofa(String::new())));
+        if spec.key == "hrir_source" && bare {
+            rewritten.get_or_insert_with(|| msg.clone()).args[value.start] =
+                OscType::String(format!("sofa:{path}"));
+        }
+    }
+    rewritten
+}
+
+/// The refusal as a client shows it: `Not changed: Kodi manages the output
+/// format`.
+pub(crate) fn managed_host_refusal_notice(manager: &str, what: &str) -> String {
+    let mut name = manager.trim().chars();
+    let manager: String = name
+        .next()
+        .map(|first| first.to_uppercase().chain(name).collect())
+        .unwrap_or_default();
+    format!("Not changed: {manager} manages {what}")
 }
 
 /// The one notification path for a control write that changed config-backed
@@ -1274,5 +1544,364 @@ mod notify_tests {
                 .any(|m| m.addr == osc_contract::STATE_REALTIME_MASTER_GAIN)
         );
         assert_ne!(control.live_state_generation(), generation);
+    }
+}
+
+#[cfg(test)]
+mod managed_host_tests {
+    use super::*;
+    use renderer::binaural::HrirSource;
+    use renderer::live_params::{BinauralMode, OutputMode};
+
+    const OPTION: &str = osc_contract::CONTROL_OPTION;
+    const OPTIONS: &str = osc_contract::CONTROL_OPTIONS;
+
+    fn msg(addr: &str, args: Vec<OscType>) -> OscMessage {
+        OscMessage {
+            addr: addr.to_string(),
+            args,
+        }
+    }
+
+    fn s(value: &str) -> OscType {
+        OscType::String(value.into())
+    }
+
+    /// Kodi's usual state: binaural output, direct rendering, the decode thread
+    /// forced on (TrueHD), on `hrir`, with `host_hrir` configured.
+    fn judged(
+        msg: &OscMessage,
+        hrir: &HrirSource,
+        host_hrir: Option<&HrirSource>,
+    ) -> Option<&'static str> {
+        let state = ManagedState {
+            output_mode: OutputMode::Binaural,
+            binaural_mode: BinauralMode::Direct,
+            decode_thread: true,
+            hrir,
+            host_hrir,
+        };
+        managed_host_refusal(msg, &state, |_, _| false)
+    }
+
+    fn refused(addr: &str, args: Vec<OscType>) -> bool {
+        judged(&msg(addr, args), &HrirSource::SafKemar, None).is_some()
+    }
+
+    #[test]
+    fn output_mode_is_refused_by_every_route() {
+        for (addr, args) in [
+            (osc_contract::CONTROL_OUTPUT_MODE, vec![s("speakers")]),
+            (osc_contract::CONTROL_OUTPUT_MODE, vec![s(" VBAP ")]),
+            (OPTION, vec![s("output_mode"), s("speaker")]),
+            (
+                OPTIONS,
+                vec![
+                    s("reverb_level"),
+                    OscType::Float(0.2),
+                    s("output_mode"),
+                    s("speaker"),
+                ],
+            ),
+        ] {
+            assert!(
+                refused(addr, args.clone()),
+                "{addr} {args:?} must be refused"
+            );
+        }
+        // Sending the output it already has changes nothing, so it goes through
+        // - a batch applying a whole group may well carry it.
+        for (addr, args) in [
+            (osc_contract::CONTROL_OUTPUT_MODE, vec![s("binaural")]),
+            (OPTION, vec![s("output_mode"), s("headphones")]),
+            (
+                OPTIONS,
+                vec![
+                    s("output_mode"),
+                    s("binaural"),
+                    s("reverb_level"),
+                    OscType::Float(0.2),
+                ],
+            ),
+        ] {
+            assert!(
+                !refused(addr, args.clone()),
+                "{addr} {args:?} must stay live"
+            );
+        }
+    }
+
+    #[test]
+    fn config_files_process_and_test_signals_are_refused() {
+        for addr in [
+            osc_contract::CONTROL_SAVE_CONFIG,
+            osc_contract::CONTROL_RELOAD_CONFIG,
+            osc_contract::CONTROL_RESTART,
+            osc_contract::CONTROL_QUIT,
+            osc_contract::CONTROL_PROFILE_SWITCH,
+            osc_contract::CONTROL_PROFILE_CREATE,
+            osc_contract::CONTROL_PROFILE_DELETE,
+            osc_contract::CONTROL_PROFILE_RENAME,
+            osc_contract::CONTROL_LAYOUT_EXPORT,
+            osc_contract::CONTROL_BACKEND_FILE_PUT,
+            osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_BEGIN,
+            osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_CHUNK,
+            osc_contract::CONTROL_BINAURAL_HRTF_UPLOAD_END,
+            osc_contract::CONTROL_RENDER_BRIDGE_PATH,
+            osc_contract::CONTROL_RENDER_INPUT_PIPE,
+            osc_contract::CONTROL_SPEAKER_TEST,
+            osc_contract::CONTROL_SPEAKER_TEST_IDLE_FEED,
+            osc_contract::CONTROL_OBJECT_TEST,
+            osc_contract::CONTROL_OBJECT_TEST_CLIP,
+            osc_contract::CONTROL_OBJECT_TEST_ROTATION,
+        ] {
+            assert!(refused(addr, vec![]), "{addr} must be refused");
+        }
+    }
+
+    #[test]
+    fn render_mode_decode_thread_and_a_fir_crossover_are_refused() {
+        for (addr, args) in [
+            (osc_contract::CONTROL_BINAURAL_MODE, vec![s("cascaded")]),
+            (OPTION, vec![s("binaural_mode"), s(" Cascade ")]),
+            (OPTIONS, vec![s("binaural_mode"), s("virtual_speakers")]),
+            (osc_contract::CONTROL_DECODE_THREAD, vec![OscType::Int(0)]),
+            (OPTION, vec![s("decode_thread"), OscType::Bool(false)]),
+            (OPTIONS, vec![s("decode_thread"), OscType::Float(0.0)]),
+            (osc_contract::CONTROL_CROSSOVER_TYPE, vec![s("fir")]),
+            (osc_contract::CONTROL_CROSSOVER_TYPE, vec![s(" FIR ")]),
+            (
+                osc_contract::CONTROL_CROSSOVER_TYPE,
+                vec![s("linear_phase")],
+            ),
+            (OPTION, vec![s("crossover_type"), s("fir")]),
+            (OPTION, vec![s("crossover_type"), s(" Linear_Phase ")]),
+            (
+                OPTIONS,
+                vec![
+                    s("crossover_fir_transition_ratio"),
+                    OscType::Float(0.5),
+                    s("crossover_type"),
+                    s("linear_phase"),
+                ],
+            ),
+        ] {
+            assert!(
+                refused(addr, args.clone()),
+                "{addr} {args:?} must be refused"
+            );
+        }
+        // What leaves them as they are, the zero-latency crossover, and other
+        // options stay available.
+        for (addr, args) in [
+            (osc_contract::CONTROL_BINAURAL_MODE, vec![s("direct")]),
+            (OPTION, vec![s("binaural_mode"), s("objects")]),
+            (osc_contract::CONTROL_DECODE_THREAD, vec![OscType::Int(1)]),
+            (OPTION, vec![s("decode_thread"), OscType::Bool(true)]),
+            (osc_contract::CONTROL_CROSSOVER_TYPE, vec![s("lr4")]),
+            (OPTION, vec![s("crossover_type"), s("lr4")]),
+            (OPTION, vec![s("crossover_type"), s("iir")]),
+            (
+                OPTIONS,
+                vec![
+                    s("crossover_type"),
+                    s("lr4"),
+                    s("crossover_fir_transition_ratio"),
+                    OscType::Float(0.5),
+                ],
+            ),
+            (
+                OPTION,
+                vec![s("synthetic_objects_enabled"), OscType::Bool(true)],
+            ),
+        ] {
+            assert!(
+                !refused(addr, args.clone()),
+                "{addr} {args:?} must stay live"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_the_registry_refuses_whole_is_not_judged() {
+        // An unknown key makes the registry drop the whole batch, so nothing in
+        // it changes and there is nothing to refuse.
+        let args = vec![s("nope"), OscType::Int(1), s("output_mode"), s("speaker")];
+        assert!(option_writes(&msg(OPTIONS, args.clone())).is_empty());
+        assert!(!refused(OPTIONS, args));
+        // Nor is a value missing its key's arguments.
+        assert!(option_writes(&msg(OPTION, vec![s("output_mode")])).is_empty());
+    }
+
+    #[test]
+    fn backend_path_params_are_refused_and_others_stay_live() {
+        let param = osc_contract::CONTROL_BACKEND_PARAM;
+        let is_path = |backend: Option<&str>, key: &str| {
+            backend.unwrap_or("script") == "script" && key == "path"
+        };
+        let state = ManagedState {
+            output_mode: OutputMode::Binaural,
+            binaural_mode: BinauralMode::Direct,
+            decode_thread: true,
+            hrir: &HrirSource::SafKemar,
+            host_hrir: None,
+        };
+        let check =
+            |args: Vec<OscType>| managed_host_refusal(&msg(param, args), &state, is_path).is_some();
+        // Named backend, and the active one (here the script backend).
+        assert!(check(vec![s("script"), s("path"), s("/dev/zero")]));
+        assert!(check(vec![s("path"), s("/dev/zero")]));
+        // Names are trimmed before they are stored, and a blank backend is the
+        // active one, so neither slips past.
+        for args in [
+            vec![s("script"), s("path "), s("/dev/zero")],
+            vec![s(" script\t"), s("path"), s("/dev/zero")],
+            vec![s(""), s(" path"), s("/dev/zero")],
+            vec![s("  "), s("path"), s("/dev/zero")],
+            vec![s(" path "), s("/dev/zero")],
+        ] {
+            assert!(check(args.clone()), "{args:?} must be refused");
+        }
+        // A non-path key, or the same key on a backend without a path param.
+        assert!(!check(vec![s("script"), s("gain"), OscType::Float(0.5)]));
+        assert!(!check(vec![s("vbap"), s("path"), s("x")]));
+    }
+
+    #[test]
+    fn rendering_controls_stay_live() {
+        for (addr, args) in [
+            (
+                osc_contract::CONTROL_REALTIME_MASTER_GAIN,
+                vec![OscType::Float(0.5), OscType::Int(1)],
+            ),
+            (
+                osc_contract::CONTROL_BINAURAL_UNIT_SCALE,
+                vec![OscType::Float(2.5)],
+            ),
+            (
+                osc_contract::CONTROL_BINAURAL_REVERB_LEVEL,
+                vec![OscType::Float(0.2)],
+            ),
+            (
+                osc_contract::CONTROL_BINAURAL_REFLECTIONS_ENABLED,
+                vec![OscType::Int(0)],
+            ),
+            (
+                osc_contract::CONTROL_BINAURAL_EAR_GAIN,
+                vec![OscType::Int(0), OscType::Float(1.0)],
+            ),
+            (osc_contract::CONTROL_HEAD_RECENTER, vec![]),
+            (osc_contract::CONTROL_LOUDNESS, vec![OscType::Int(1)]),
+            (osc_contract::CONTROL_METERING, vec![OscType::Int(1)]),
+            (osc_contract::CONTROL_INPUT_REFRESH, vec![]),
+            (osc_contract::CONTROL_BACKEND_FILE_GET, vec![]),
+            (osc_contract::CONTROL_CONFIG_LAYOUT, vec![s("{}")]),
+            (OPTIONS, vec![s("reverb_level"), OscType::Float(0.2)]),
+        ] {
+            assert!(!refused(addr, args), "{addr} must stay live");
+        }
+    }
+
+    #[test]
+    fn hrir_source_may_not_name_a_new_file() {
+        let hrir = osc_contract::CONTROL_BINAURAL_HRIR_SOURCE;
+        // Built-in and parametric sets read no file.
+        for source in ["saf", "synthetic", "pinna", "prtf", "sofa", "brir"] {
+            assert!(!refused(hrir, vec![s(source)]), "{source} reads no path");
+        }
+        for (addr, args) in [
+            (hrir, vec![s("sofa:/storage/other.sofa")]),
+            (hrir, vec![s("brir:/storage/room.sofa")]),
+            (
+                OPTION,
+                vec![s("hrir_source"), s("sofa:/storage/other.sofa")],
+            ),
+            (
+                OPTIONS,
+                vec![
+                    s("reverb_level"),
+                    OscType::Float(0.2),
+                    s("hrir_source"),
+                    s(" brir:/storage/room.sofa"),
+                ],
+            ),
+        ] {
+            assert!(
+                refused(addr, args.clone()),
+                "{addr} {args:?} must be refused"
+            );
+        }
+
+        // The set in use may be sent back as it is.
+        let kodi = "/storage/.kodi/userdata/omniphony/hrtf.sofa";
+        let current = HrirSource::Sofa(kodi.into());
+        let same = msg(hrir, vec![s(&format!("sofa:{kodi}"))]);
+        assert!(judged(&same, &current, None).is_none());
+        let other = msg(hrir, vec![s("sofa:/storage/other.sofa")]);
+        assert!(judged(&other, &current, None).is_some());
+    }
+
+    #[test]
+    fn the_host_sofa_stays_reachable_after_switching_away() {
+        let hrir = osc_contract::CONTROL_BINAURAL_HRIR_SOURCE;
+        let kodi = "/storage/.kodi/userdata/omniphony/hrtf.sofa";
+        let host = HrirSource::Sofa(kodi.into());
+        // Now on the built-in set, the host's file is still allowed back ...
+        let back = msg(hrir, vec![s(&format!("sofa:{kodi}"))]);
+        assert!(judged(&back, &HrirSource::SafKemar, Some(&host)).is_none());
+        // ... and another file still is not.
+        let other = msg(hrir, vec![s("sofa:/storage/other.sofa")]);
+        assert!(judged(&other, &HrirSource::SafKemar, Some(&host)).is_some());
+    }
+
+    #[test]
+    fn a_bare_sofa_means_the_host_file() {
+        let hrir = osc_contract::CONTROL_BINAURAL_HRIR_SOURCE;
+        let kodi = "/storage/.kodi/userdata/omniphony/hrtf.sofa";
+        let host = HrirSource::Sofa(kodi.into());
+        let file = s(&format!("sofa:{kodi}"));
+        let rewritten = managed_host_rewrite(&msg(hrir, vec![s("sofa")]), Some(&host))
+            .expect("a bare sofa names the host file");
+        assert_eq!(rewritten.addr, hrir);
+        assert_eq!(rewritten.args, vec![file.clone()]);
+        // By the other routes too, in the value's own place.
+        let option =
+            managed_host_rewrite(&msg(OPTION, vec![s("hrir_source"), s("sofa")]), Some(&host))
+                .expect("through /control/option");
+        assert_eq!(option.args, vec![s("hrir_source"), file.clone()]);
+        let batch = vec![
+            s("reverb_level"),
+            OscType::Float(0.2),
+            s("hrir_source"),
+            s("sofa"),
+        ];
+        let options = managed_host_rewrite(&msg(OPTIONS, batch), Some(&host))
+            .expect("through /control/options");
+        assert_eq!(
+            options.args,
+            vec![
+                s("reverb_level"),
+                OscType::Float(0.2),
+                s("hrir_source"),
+                file
+            ]
+        );
+
+        // Anything else is left alone.
+        assert!(managed_host_rewrite(&msg(hrir, vec![s("sofa:/x.sofa")]), Some(&host)).is_none());
+        assert!(managed_host_rewrite(&msg(hrir, vec![s("saf")]), Some(&host)).is_none());
+        assert!(managed_host_rewrite(&msg(hrir, vec![s("sofa")]), None).is_none());
+        let built_in = HrirSource::SafKemar;
+        assert!(managed_host_rewrite(&msg(hrir, vec![s("sofa")]), Some(&built_in)).is_none());
+        let other = osc_contract::CONTROL_OUTPUT_MODE;
+        assert!(managed_host_rewrite(&msg(other, vec![s("sofa")]), Some(&host)).is_none());
+    }
+
+    #[test]
+    fn the_notice_names_the_host_and_what_it_manages() {
+        assert_eq!(
+            managed_host_refusal_notice("kodi", "the output format"),
+            "Not changed: Kodi manages the output format"
+        );
     }
 }

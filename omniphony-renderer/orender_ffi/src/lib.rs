@@ -331,10 +331,19 @@ fn build_engine(cfg: &OrenderConfig) -> Result<Engine> {
         config_bridge.as_deref(),
     )
     .is_ok();
+    // A managed host (Kodi) skips the negotiation. It may open this engine
+    // while the one it replaces still holds the port, in another process that
+    // neither yields nor releases it until this open has returned, so the
+    // negotiation could only spend its whole budget. There is no sidecar to
+    // settle either - a managed engine never writes one - and the listener
+    // takes the port once it frees (`Engine::enable_osc`).
+    let managed = render_cfg
+        .as_ref()
+        .is_some_and(|c| c.managed_host().is_some());
     if bridge_resolvable {
         // A same-process degraded reporter may itself hold the port.
         stop_degraded_reporter_global();
-        if let Some(opts) = osc_opts.as_ref()
+        if let Some(opts) = osc_opts.as_ref().filter(|_| !managed)
             && !orender_engine::osc::negotiate_rx_port(opts.port_in)
         {
             log::warn!(

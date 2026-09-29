@@ -434,7 +434,15 @@ fn host_options_json(host: &dyn crate::HostControlHandler) -> Option<String> {
     )
 }
 
-fn build_renderer_capabilities_json(has_audio: bool, has_input: bool) -> String {
+/// The capabilities handshake (see the description above `hrir_params_json`).
+/// A managed engine (`render.managed_host`) is labelled with the application
+/// named there instead; Studio reads `host` for the label alone, and takes its
+/// behaviour from `variant`.
+fn build_renderer_capabilities_json(
+    has_audio: bool,
+    has_input: bool,
+    managed_host: Option<&str>,
+) -> String {
     let mut domains = vec!["renderer", "layout", "speakers", "loudness"];
     let mut control_config = vec!["layout", "speakers"];
     if has_audio {
@@ -451,7 +459,7 @@ fn build_renderer_capabilities_json(has_audio: bool, has_input: bool) -> String 
     json!({
         "producer": "renderer",
         "variant": if has_audio { "standalone" } else { "embedded" },
-        "host": if has_audio { "cli" } else { "mpv" },
+        "host": managed_host.unwrap_or(if has_audio { "cli" } else { "mpv" }),
         "domains": domains,
         "realtime": ["master_gain", "speaker_gain"],
         "spatial": true,
@@ -472,7 +480,7 @@ mod capability_tests {
 
     #[test]
     fn standalone_advertises_full_set() {
-        let v = parse(&build_renderer_capabilities_json(true, true));
+        let v = parse(&build_renderer_capabilities_json(true, true, None));
         assert_eq!(v["variant"], "standalone");
         assert_eq!(v["host"], "cli");
         assert_eq!(v["fileRequestIds"], true);
@@ -487,7 +495,7 @@ mod capability_tests {
 
     #[test]
     fn embedded_drops_audio_and_input() {
-        let v = parse(&build_renderer_capabilities_json(false, false));
+        let v = parse(&build_renderer_capabilities_json(false, false, None));
         assert_eq!(v["variant"], "embedded");
         assert_eq!(v["host"], "mpv");
         assert_eq!(v["fileRequestIds"], true);
@@ -502,6 +510,22 @@ mod capability_tests {
         assert!(!cc.iter().any(|c| c == "adaptive_resampling"));
         assert!(!cc.iter().any(|c| c == "input"));
         assert!(cc.iter().any(|c| c == "speakers"));
+    }
+
+    #[test]
+    fn managed_host_names_itself_and_stays_embedded() {
+        let v = parse(&build_renderer_capabilities_json(
+            false,
+            false,
+            Some("kodi"),
+        ));
+        assert_eq!(v["host"], "kodi");
+        // Studio takes its behaviour from the variant; only the label changes.
+        assert_eq!(v, {
+            let mut mpv = parse(&build_renderer_capabilities_json(false, false, None));
+            mpv["host"] = "kodi".into();
+            mpv
+        });
     }
 }
 
@@ -598,7 +622,9 @@ pub fn build_live_state_bundle_with_host(
         OscPacket::Message(OscMessage {
             addr: crate::osc_contract::STATE_CAPABILITIES.to_string(),
             args: vec![OscType::String(build_renderer_capabilities_json(
-                has_audio, has_input,
+                has_audio,
+                has_input,
+                control.managed_host().as_deref(),
             ))],
         }),
         OscPacket::Message(OscMessage {

@@ -257,8 +257,12 @@ fn non_identity_quat(pose: renderer::binaural::HeadPose) -> Option<[f32; 4]> {
 /// Perform targeted write-backs against the control's config file, if it has
 /// one. Best-effort: a failure is logged, never raised — the live change has
 /// already been applied, and the explicit Save still covers it.
+///
+/// None for a managed engine (`render.managed_host`): its host writes the
+/// whole config for every stream, so the change lasts for this one, like any
+/// other a client makes.
 pub fn persist_ops(control: &RendererControl, ops: &[PersistOp]) {
-    if ops.is_empty() {
+    if ops.is_empty() || control.is_managed() {
         return;
     }
     let Some(path) = control.config_path() else {
@@ -474,6 +478,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_managed_engine_writes_nothing_back() {
+        let path = temp_config_path("managed");
+        let written = "render:\n  managed_host: kodi\n";
+        std::fs::write(&path, written).unwrap();
+
+        let control = crate::test_support::fixture_control();
+        control.set_managed_host(Some("kodi".into()));
+        control.live.write().binaural.tracking.reference =
+            renderer::binaural::HeadPose::from_quat_array([0.5, 0.5, 0.5, 0.5]);
+        control.set_config_path(path.clone());
+        persist_ops(&control, &[PersistOp::HEAD_CENTER, PersistOp::METER_RATE]);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

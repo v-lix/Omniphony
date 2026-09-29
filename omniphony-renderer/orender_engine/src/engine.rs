@@ -380,7 +380,17 @@ impl Engine {
             sender.set_default_metering(true);
         }
         sender.attach_renderer_control(self.renderer.renderer_control());
-        sender.start_listener(opts.port_in, true)?;
+        if self.renderer.renderer_control().is_managed() {
+            // A managed host may open this engine before it closes the one this
+            // replaces - Kodi does on an audio-track change, and there the two
+            // are separate processes, so neither the in-process release nor the
+            // yield reaches the old one. It frees the port as it exits, which
+            // is after this open returns: waiting here would only stall the
+            // host. Take the port when it frees instead.
+            sender.start_listener_when_free(opts.port_in)?;
+        } else {
+            sender.start_listener(opts.port_in, true)?;
+        }
         // Meter cadence reads the RendererControl atomic each poll (source of
         // truth, OSC-adjustable, persisted).
         self.audio_meter = Some(AudioMeter::new_with_rate_atomic(
@@ -514,14 +524,29 @@ impl Engine {
         if live_restored {
             control.mark_dirty();
         }
+        control.set_managed_host(
+            render_cfg
+                .as_ref()
+                .and_then(|c| c.managed_host())
+                .map(str::to_string),
+        );
+        // The source the host's config chose, seeded above: a client may leave
+        // it and come back to it (`osc::dispatch::managed_host_refusal`).
+        if control.is_managed() {
+            let seeded = control.live.read().binaural.hrir_source.clone();
+            control.set_host_hrir_source(Some(seeded));
+        }
 
         // Overlay display prefs (enable / labels / trails) are owned and
         // persisted by orender now, in a small dedicated file next to the
         // config — loaded here at startup and auto-saved on each live change.
         // Deliberately NOT part of the savable config (no mark_dirty / save).
+        // Not for a managed host, which draws no overlay and whose directory
+        // this engine writes nothing into.
         let overlay_prefs = config_yaml_path
             .map(Path::to_path_buf)
             .or_else(crate::default_config_path)
+            .filter(|_| !control.is_managed())
             .and_then(|p| p.parent().map(|d| d.join("overlay-prefs.conf")));
         if let Some(p) = overlay_prefs {
             overlay::load_prefs(&p);
@@ -1078,6 +1103,18 @@ impl Engine {
         } else {
             DecodeThreadMode::Off
         };
+        // A managed host's clients may not change what it forced, so the live
+        // option they are shown carries it rather than a preference nothing
+        // follows. Such a host never saves the option, so this goes no further.
+        let control = self.renderer.renderer_control();
+        if control.is_managed() {
+            let was = std::mem::replace(&mut control.live.write().decode_thread, on);
+            if was != on {
+                if let Some(Err(e)) = self.osc.as_ref().map(|osc| osc.send_live_state_bundle()) {
+                    log::warn!("decode thread state not sent to OSC clients: {e:#}");
+                }
+            }
+        }
         Ok(())
     }
 

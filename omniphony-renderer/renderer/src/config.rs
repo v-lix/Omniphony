@@ -149,6 +149,19 @@ pub struct RenderConfig {
     pub osc_host: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub osc_port: Option<u16>,
+    /// Name of the application that owns this engine and writes this config
+    /// for every stream (`kodi`), or absent for an engine that owns itself.
+    ///
+    /// A managed engine treats the config as the host's: nothing live-edited
+    /// is saved, persisted or handed to the next instance, and a leftover
+    /// live-handoff sidecar is dropped rather than restored. Over OSC it
+    /// refuses what would break the host or reach past it — see
+    /// `orender_engine`'s `osc::dispatch::managed_host_refusal` — and it never
+    /// makes the host wait for the RX port: a successor that a host opens
+    /// before closing its predecessor starts at once and takes the port when
+    /// it frees. The name is what `state/capabilities` reports as `host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_host: Option<String>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         alias = "sink",
@@ -649,6 +662,15 @@ pub struct LiveInputConfig {
 }
 
 impl RenderConfig {
+    /// The application that owns this engine (`render.managed_host`), when one
+    /// is named; a blank name counts as none.
+    pub fn managed_host(&self) -> Option<&str> {
+        self.managed_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+    }
+
     /// When the room geometry is stored in metres (`room_*_m`), derive the
     /// renderer-facing ratios + the layout radius from them so the rest of the
     /// pipeline keeps consuming `room_ratio` + `current_layout.radius_m`
@@ -938,6 +960,20 @@ impl Config {
         // destroy→create cycle) must win over the older cached overlay.
         let sidecar = live_sidecar_path(path);
         if sidecar.exists() {
+            // A host that writes the config for every stream has already said
+            // everything this instance should start from; a sidecar next to
+            // it can only be an earlier stream's, and restoring it would put
+            // that stream's settings over the ones just written.
+            let persistent = Self::load_or_default(path);
+            if persistent
+                .render
+                .as_ref()
+                .is_some_and(|r| r.managed_host().is_some())
+            {
+                let _ = std::fs::remove_file(&sidecar);
+                LIVE_OVERLAY.lock().unwrap().remove(path);
+                return (persistent, false);
+            }
             let fresh = std::fs::metadata(&sidecar)
                 .and_then(|m| m.modified())
                 .ok()
@@ -1470,6 +1506,33 @@ render:
         assert!(restored);
         assert_eq!(bridge_of(&cfg_b).as_deref(), Some("/tmp/live-b.so"));
         assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn managed_host_config_drops_a_fresh_sidecar_unapplied() {
+        let dir = sidecar_test_dir("managed");
+        let config = dir.join("config.yaml");
+        let managed = Config {
+            render: Some(RenderConfig {
+                bridge_path: Some(PathBuf::from("/tmp/base.so")),
+                managed_host: Some("kodi".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        managed.save(&config).unwrap();
+        let sidecar = live_sidecar_path(&config);
+        write_config_with_bridge(&sidecar, "/tmp/live.so");
+
+        let (cfg, restored) = Config::load_or_default_with_live(&config);
+        assert!(!restored, "the host's config is the whole story");
+        assert_eq!(bridge_of(&cfg).as_deref(), Some("/tmp/base.so"));
+        assert_eq!(
+            cfg.render.as_ref().and_then(|r| r.managed_host.as_deref()),
+            Some("kodi")
+        );
+        assert!(!sidecar.exists(), "the leftover sidecar must be deleted");
+        assert!(!live_overlay_active(&config));
     }
 }
 

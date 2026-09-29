@@ -39,6 +39,12 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 /// the port is released.
 const YIELD_REBIND_BUDGET: Duration = Duration::from_secs(5);
 
+/// How often a listener started with [`OscSender::start_listener_when_free`]
+/// tries the RX port again while the instance it replaces still holds it. The
+/// new listener's first chance at the port comes at most this long after the
+/// old one exits.
+const RX_PORT_WAIT_POLL: Duration = Duration::from_millis(250);
+
 /// Poll interval while waiting for the RX port to free up after a yield request.
 const YIELD_REBIND_POLL: Duration = Duration::from_millis(50);
 
@@ -222,6 +228,50 @@ fn bind_rx_socket(
     }
 }
 
+/// Make a freshly bound RX socket this process's listener: the read timeout the
+/// listener loop polls its stop flag by, and the registration that lets a
+/// same-process successor (mpv track switch) reclaim the port instantly instead
+/// of timing out the UDP yield.
+fn claim_rx_socket(rx_socket: &UdpSocket, rx_port: u16, stop: &Arc<AtomicBool>) {
+    let _ = rx_socket.set_read_timeout(Some(Duration::from_millis(200)));
+    *LOCAL_RX_RELEASE.lock().unwrap() = Some(Arc::clone(stop));
+    log::info!("OSC listener ready on port {}", rx_port);
+}
+
+/// Wait in the listener thread for `rx_port` to free, for
+/// [`OscSender::start_listener_when_free`]. `None` when `stop` is raised first
+/// or the port fails to bind for any reason other than being held.
+fn wait_for_rx_port(rx_port: u16, stop: &Arc<AtomicBool>) -> Option<UdpSocket> {
+    let started = std::time::Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        match UdpSocket::bind(("0.0.0.0", rx_port)) {
+            Ok(rx_socket) => {
+                log::info!(
+                    "OSC RX port {} freed after {} ms",
+                    rx_port,
+                    started.elapsed().as_millis()
+                );
+                claim_rx_socket(&rx_socket, rx_port, stop);
+                return Some(rx_socket);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                std::thread::sleep(RX_PORT_WAIT_POLL);
+            }
+            Err(e) => {
+                log::error!(
+                    "OSC listener: failed to bind port {} ({}); running without OSC control",
+                    rx_port,
+                    e
+                );
+                return None;
+            }
+        }
+    }
+}
+
 /// Pre-flight port negotiation for hosts that must settle ownership of the RX
 /// port *before* loading config (the FFI host consumes the live-state sidecar
 /// a yielded instance writes on shutdown). On success the bound socket is kept
@@ -381,10 +431,17 @@ pub struct OscSender {
 }
 
 impl OscSender {
+    /// `default_target` is the fixed client that always receives broadcasts
+    /// (`--osc-host`/`--osc-port`). Port 0 means none: nothing can be sent to
+    /// port 0, and a host whose clients all register (Studio does) has no use
+    /// for one - with the default target on the RX port, every broadcast would
+    /// otherwise land on this instance's own listener.
     pub fn new(default_target: SocketAddrV4) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         let clients = Arc::new(OscClientRegistry::new(CLIENT_TIMEOUT));
-        clients.insert_permanent(SocketAddr::V4(default_target));
+        if default_target.port() != 0 {
+            clients.insert_permanent(SocketAddr::V4(default_target));
+        }
         // Per-instance id: mixes pid and a sub-second timestamp so it differs
         // both across processes (CLI vs the mpv-embedded host) and across
         // successive instances in the same process. Only its *change* matters,
@@ -442,6 +499,31 @@ impl OscSender {
     /// (loud error, no audio regression) — a port squatter must never cost the
     /// listener spatial audio.
     pub fn start_listener(&mut self, rx_port: u16, request_yield: bool) -> Result<()> {
+        self.spawn_listener(rx_port, request_yield, false)
+    }
+
+    /// Start the listener without ever making the caller wait for `rx_port`,
+    /// for a host that opens a successor engine before closing the one it
+    /// replaces, in another process (Kodi's helper on an audio-track change).
+    ///
+    /// The port is tried once. If it is still held - by the instance this one
+    /// replaces, which frees it as it exits - the listener thread starts anyway
+    /// and takes the port as soon as it frees, trying every
+    /// [`RX_PORT_WAIT_POLL`]. The holder is never asked to yield. Until then no
+    /// client can register, so nothing is sent. [`is_listening`] reports only
+    /// a port bound by this call itself.
+    ///
+    /// [`is_listening`]: Self::is_listening
+    pub fn start_listener_when_free(&mut self, rx_port: u16) -> Result<()> {
+        self.spawn_listener(rx_port, false, true)
+    }
+
+    fn spawn_listener(
+        &mut self,
+        rx_port: u16,
+        request_yield: bool,
+        wait_for_port: bool,
+    ) -> Result<()> {
         self.rx_port = rx_port;
         let socket = Arc::clone(&self.socket);
         let clients = Arc::clone(&self.clients);
@@ -457,8 +539,17 @@ impl OscSender {
             self.listener_stop.store(false, Ordering::Relaxed);
         }
 
+        // `None`: the port is still held and the listener thread waits for it.
         let rx_socket = match bind_rx_socket(rx_port, request_yield, YIELD_REBIND_BUDGET) {
-            Ok(socket) => socket,
+            Ok(socket) => Some(socket),
+            Err(e) if wait_for_port && e.kind() == std::io::ErrorKind::AddrInUse => {
+                log::info!(
+                    "OSC RX port {} is still held, by the instance this one replaces if \
+                     the host has not closed it yet; listening once it frees",
+                    rx_port
+                );
+                None
+            }
             Err(e) => {
                 log::error!(
                     "OSC listener: failed to bind port {} ({}); running without OSC control",
@@ -469,20 +560,27 @@ impl OscSender {
                 return Ok(());
             }
         };
-        let _ = rx_socket.set_read_timeout(Some(Duration::from_millis(200)));
-        // Register this listener so a same-process successor (mpv track switch)
-        // can reclaim the port instantly instead of timing out the UDP yield.
-        *LOCAL_RX_RELEASE.lock().unwrap() = Some(Arc::clone(&stop));
-        log::info!("OSC listener ready on port {}", rx_port);
+        if let Some(rx_socket) = rx_socket.as_ref() {
+            claim_rx_socket(rx_socket, rx_port, &stop);
+        }
+        let bound_now = rx_socket.is_some();
 
-        // Taken only once the bind above succeeded: a resume that could not
-        // re-acquire the port re-arms standby, and the next attempt must still
-        // adopt the handoff.
+        // Taken only once the bind above succeeded (or is certain to be
+        // retried): a resume that could not re-acquire the port re-arms
+        // standby, and the next attempt must still adopt the handoff.
         let adopt_live = std::mem::take(&mut self.adopt_live_on_listen);
 
         let handle = std::thread::Builder::new()
             .name("osc-listener".into())
             .spawn(move || {
+                let rx_socket = match rx_socket {
+                    Some(rx_socket) => rx_socket,
+                    None => match wait_for_rx_port(rx_port, &stop) {
+                        Some(rx_socket) => rx_socket,
+                        // Stopped before the port freed, or it cannot be bound.
+                        None => return,
+                    },
+                };
                 let mut realtime_seq = RealtimeSeqState::default();
                 // Serialized gain table is cached here and shared with the
                 // recompute threads this loop spawns, so it's re-serialized only
@@ -672,7 +770,7 @@ impl OscSender {
             })?;
 
         *self.listener_thread.lock().unwrap() = Some(handle);
-        self.listener_bound = true;
+        self.listener_bound = bound_now;
 
         Ok(())
     }
@@ -688,6 +786,11 @@ impl OscSender {
         let Some(control) = self.control.as_ref() else {
             return;
         };
+        // A managed host writes the successor's config itself, for the stream
+        // it is about to play; this instance's edits belonged to its own.
+        if control.is_managed() {
+            return;
+        }
         // Only unsaved changes are worth handing over; a clean state would just
         // make the successor flag a phantom "unsaved" diff.
         if !control.config_dirty.load(Ordering::Relaxed) {
@@ -1303,5 +1406,116 @@ mod yield_tests {
             bind_rx_socket(port, true, Duration::from_secs(5)).expect("port freed after yield");
         assert_eq!(socket.local_addr().unwrap().port(), port);
         t.join().unwrap();
+    }
+
+    #[test]
+    fn port_zero_target_registers_no_fixed_client() {
+        let none = OscSender::new(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        assert!(
+            !none.has_osc_clients(),
+            "nothing may be sent before a register"
+        );
+        assert!(
+            test_sender().has_osc_clients(),
+            "a real target stays permanent"
+        );
+    }
+
+    fn stop_listener(sender: &mut OscSender) {
+        sender.listener_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = sender.listener_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn owns_local_release(sender: &OscSender) -> bool {
+        LOCAL_RX_RELEASE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|stop| Arc::ptr_eq(stop, &sender.listener_stop))
+    }
+
+    /// Kodi opens the replacement helper before closing the old one, from
+    /// another process: the open must not wait, the holder must not be asked
+    /// to yield, and the listener must take the port once it frees.
+    #[test]
+    fn waiting_listener_returns_at_once_and_takes_the_port_when_it_frees() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *LOCAL_RX_RELEASE.lock().unwrap() = None;
+        let port = free_port();
+        let squatter = UdpSocket::bind(("0.0.0.0", port)).unwrap();
+        squatter
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+
+        let mut sender = test_sender();
+        let started = std::time::Instant::now();
+        sender
+            .start_listener_when_free(port)
+            .expect("a held port is not an error");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the caller must not wait for the port ({:?})",
+            started.elapsed()
+        );
+        assert!(!sender.is_listening(), "the port was held at the call");
+
+        let mut buf = [0u8; 256];
+        assert!(
+            squatter.recv_from(&mut buf).is_err(),
+            "the holder must not be asked to yield"
+        );
+        assert!(!owns_local_release(&sender));
+
+        drop(squatter);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !owns_local_release(&sender) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never took the freed port"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            UdpSocket::bind(("0.0.0.0", port)).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the listener holds the port now"
+        );
+
+        stop_listener(&mut sender);
+        *LOCAL_RX_RELEASE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn waiting_listener_stops_without_ever_getting_the_port() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *LOCAL_RX_RELEASE.lock().unwrap() = None;
+        let port = free_port();
+        let _squatter = UdpSocket::bind(("0.0.0.0", port)).unwrap();
+
+        let mut sender = test_sender();
+        sender.start_listener_when_free(port).unwrap();
+        let started = std::time::Instant::now();
+        stop_listener(&mut sender);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the wait must end with the engine ({:?})",
+            started.elapsed()
+        );
+        assert!(!owns_local_release(&sender));
+    }
+
+    /// A free port binds in the call itself, like `start_listener`.
+    #[test]
+    fn waiting_listener_binds_a_free_port_immediately() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let port = free_port();
+        let mut sender = test_sender();
+        sender.start_listener_when_free(port).unwrap();
+        assert!(sender.is_listening());
+        assert!(owns_local_release(&sender));
+        stop_listener(&mut sender);
+        *LOCAL_RX_RELEASE.lock().unwrap() = None;
     }
 }
