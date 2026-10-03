@@ -733,15 +733,20 @@ impl Engine {
     /// after [`reset`](Self::reset). A host that buffers the rendered audio
     /// plays it later than it renders it, and only the host knows by how much;
     /// this passes it on to OSC clients ([`OscSender::send_heard`]), which can
-    /// then show each block when it is heard. The engine itself holds nothing
-    /// back.
+    /// then show each block when it is heard.
+    ///
+    /// TEMP, for Studio 0.6.0, which shows each block as it arrives: from the
+    /// first report on, the engine also holds the stream until the listener
+    /// reaches each block ([`OscSender::hold_until_heard`]).
     pub fn set_heard_us(&mut self, us: i64) {
         let rate = self.sample_rate.max(1);
         // Rounded up: the timestamps are rounded down, so a block's own start
         // comes back to exactly its position rather than a sample short of it.
         let pos = (i128::from(us.max(0)) * i128::from(rate) + 999_999) / 1_000_000;
         if let Some(osc) = self.osc.as_ref() {
-            osc.send_heard(u64::try_from(pos).unwrap_or(u64::MAX), rate);
+            let pos = u64::try_from(pos).unwrap_or(u64::MAX);
+            osc.hold_until_heard(pos);
+            osc.send_heard(pos, rate);
         }
     }
 
@@ -801,6 +806,9 @@ impl Engine {
         if let Some(osc) = self.osc.as_mut() {
             osc.request_full_object_resend();
             osc.rewind_playout();
+            // TEMP: what is held for a listener who will now never reach it
+            // goes with the old positions.
+            osc.rewind_hold();
         }
         self.decoded_samples = 0;
         self.stream.drc = Default::default();
@@ -1309,6 +1317,7 @@ impl Engine {
         // Everything sent while rendering this frame describes it.
         if let Some(osc) = self.osc.as_ref() {
             osc.render_at(sample_pos_at_start);
+            osc.hold_render_at(sample_pos_at_start);
         }
         render::follow_stream_rate(&mut self.renderer, frame.sampling_frequency)?;
 

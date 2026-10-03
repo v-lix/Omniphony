@@ -122,8 +122,10 @@ impl OscSender {
             addr: osc_contract::PLAYOUT_BLOCK.to_string(),
             args: vec![OscType::Long(block.min(i64::MAX as u64) as i64)],
         });
+        // TEMP, for Studio 0.6.0: held with the messages it names, when an
+        // embedded host has them held (see `super::hold`).
         if let Ok(bytes) = rosc::encoder::encode(&packet) {
-            self.send_raw_to_all(&bytes);
+            self.send_or_hold(super::hold::Audience::All, &bytes);
         }
     }
 }

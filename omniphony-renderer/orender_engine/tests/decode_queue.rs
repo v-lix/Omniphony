@@ -623,6 +623,88 @@ fn heard_us_publishes_the_listener_and_marks_each_block() {
     assert!(first.is_some_and(|pos| pos < 4 * 1536), "{first:?}");
 }
 
+/// TEMP, for Studio 0.6.0 (drop with `osc::hold`): once a host says where the
+/// listener is, the stream - each block's marker with it - is held until the
+/// listener reaches its block and then sent in order, and a reset drops what
+/// is held.
+#[test]
+fn heard_us_holds_the_stream_until_the_listener_reaches_it() {
+    use runtime_control::osc_contract::{METER_MASTER, PLAYOUT_BLOCK};
+
+    fn blocks(messages: &[rosc::OscMessage]) -> Vec<i64> {
+        messages
+            .iter()
+            .filter(|m| m.addr == PLAYOUT_BLOCK)
+            .filter_map(|m| long_arg(m, 0))
+            .collect()
+    }
+    fn marked_before_metered(messages: &[rosc::OscMessage]) -> bool {
+        let mut marked = false;
+        messages.iter().all(|m| {
+            marked |= m.addr == PLAYOUT_BLOCK;
+            m.addr != METER_MASTER || marked
+        })
+    }
+
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut engine, _, _) = engine_with_control();
+    engine
+        .enable_osc(orender_engine::OscOptions {
+            host: "127.0.0.1".into(),
+            port_out: socket.local_addr().unwrap().port(),
+            port_in: 0,
+            metering: true,
+        })
+        .unwrap();
+
+    // Heard from 0, as the Kodi helper reports it at the open: only the block
+    // being heard goes out.
+    engine.set_heard_us(0);
+    let held = feed_and_listen(&mut engine, &socket, 8);
+    assert!(blocks(&held).iter().all(|&b| b == 0), "{:?}", blocks(&held));
+
+    // Three blocks heard: 4 608 samples, 96 ms at 48 kHz.
+    engine.set_heard_us(96_000);
+    let first = osc_messages(&socket, Duration::from_millis(100));
+    let first_blocks = blocks(&first);
+    assert!(
+        first_blocks.iter().all(|&b| b > 0 && b <= 4608),
+        "{first_blocks:?}"
+    );
+
+    // The rest once the listener is past the end of what was rendered.
+    engine.set_heard_us(1_000_000);
+    let rest = osc_messages(&socket, Duration::from_millis(100));
+    let rest_blocks = blocks(&rest);
+    assert!(rest_blocks.iter().all(|&b| b > 4608), "{rest_blocks:?}");
+
+    let released: Vec<i64> = first_blocks.iter().chain(&rest_blocks).copied().collect();
+    assert!(!released.is_empty(), "something was held");
+    assert!(
+        released.windows(2).all(|w| w[0] < w[1]),
+        "in order: {released:?}"
+    );
+    assert!(
+        first.iter().chain(&rest).any(|m| m.addr == METER_MASTER),
+        "the meters were held too"
+    );
+    assert!(marked_before_metered(&first) && marked_before_metered(&rest));
+
+    // A reset drops what is held about the old timeline: heard from 0 again,
+    // three blocks wait, and none of them is sent after the next reset.
+    engine.reset();
+    let after_reset = feed_and_listen(&mut engine, &socket, 4);
+    assert!(
+        blocks(&after_reset).iter().all(|&b| b == 0),
+        "{:?}",
+        blocks(&after_reset)
+    );
+    engine.reset();
+    engine.set_heard_us(1_000_000);
+    let dropped = osc_messages(&socket, Duration::from_millis(100));
+    assert!(blocks(&dropped).is_empty(), "{:?}", blocks(&dropped));
+}
+
 /// A managed host's clients may not change the thread it forces, so the live
 /// option shows what it forced; an engine nobody manages keeps the user's.
 #[test]

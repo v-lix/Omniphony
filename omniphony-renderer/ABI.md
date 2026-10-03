@@ -113,6 +113,15 @@ stream's rate, so this is the rate the audio comes back at: hosts poll it to
 detect when they must reopen at the source rate. Probe the symbol, not minor
 13.
 
+TEMP, until a Studio release that follows `/omniphony/playout/heard` is
+current: Studio 0.6.0 shows each block as it arrives, so an embedded host that
+sets `heard_us` also has the engine hold the stream messages - each block's
+marker, object frames, timestamps, bed config and meter bundles - until the
+listener reaches their block, and send them then, in order. A reset drops what
+is held, and past 8 MiB the oldest goes out early. The heard position and the
+markers are sent as upstream sends them, so a client that follows the sound
+finds every block already heard. The standalone `orender` is unaffected.
+
 `orender_hrir_in_use` names the HRIR set the binaural path is convolving
 with, using the `hrir_source` selectors (`saf`, `sofa`, `brir`, ...), with the
 `orender_source_label` query/fill convention. It reports the set in use, not

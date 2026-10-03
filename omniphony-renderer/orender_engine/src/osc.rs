@@ -13,6 +13,7 @@ mod client_registry;
 mod dispatch;
 mod export;
 mod gaintable;
+mod hold;
 mod metadata_emit;
 mod playout;
 mod profiles;
@@ -24,6 +25,7 @@ use self::client_registry::OscClientRegistry;
 use self::dispatch::{RealtimeSeqState, handle_control_message};
 use self::export::build_live_state;
 use self::gaintable::GaintableCache;
+use self::hold::{Audience, Hold};
 use self::transport::{
     flush_pending_logs, resolve_register_addr, send_buffered_logs_to_client, send_metering_state,
     send_raw_filtered,
@@ -428,6 +430,10 @@ pub struct OscSender {
     /// Block markers and the heard position, for clients that show what is
     /// heard rather than what was just rendered (see [`playout`]).
     playout: playout::PlayoutMarks,
+    /// TEMP, for Studio 0.6.0: the stream held until an embedded host says the
+    /// listener has reached it - see [`hold`]. `None` until the host first
+    /// says where the listener is, and for a host that never does.
+    hold: Mutex<Option<Hold>>,
 }
 
 impl OscSender {
@@ -470,6 +476,7 @@ impl OscSender {
             listener_bound: false,
             adopt_live_on_listen: false,
             playout: playout::PlayoutMarks::new(),
+            hold: Mutex::new(None),
         })
     }
 
@@ -920,7 +927,7 @@ impl OscSender {
     /// time — see [`playout`].
     fn send_to_all(&self, bytes: &[u8]) {
         self.mark_block();
-        self.send_raw_to_all(bytes);
+        self.send_or_hold(Audience::All, bytes);
     }
 
     fn send_raw_to_all(&self, bytes: &[u8]) {
@@ -932,9 +939,62 @@ impl OscSender {
     /// [`send_to_all`]: Self::send_to_all
     fn send_to_metering_clients(&self, bytes: &[u8]) {
         self.mark_block();
-        send_raw_filtered(&self.socket, &self.clients, bytes, |client| {
-            client.metering_enabled
-        });
+        self.send_or_hold(Audience::Metering, bytes);
+    }
+
+    /// TEMP, for Studio 0.6.0: a stream message, block markers included, goes
+    /// through here, so that an embedded host that says where the listener is
+    /// has it held until the listener reaches its block - see [`hold`].
+    fn send_or_hold(&self, to: Audience, bytes: &[u8]) {
+        let mut hold = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = hold.as_mut()
+            && h.keep(to, bytes)
+        {
+            // Only the bound on what is held can make anything due here.
+            while let Some((to, bytes)) = h.next_due() {
+                self.send_now(to, &bytes);
+            }
+            return;
+        }
+        drop(hold);
+        self.send_now(to, bytes);
+    }
+
+    fn send_now(&self, to: Audience, bytes: &[u8]) {
+        match to {
+            Audience::All => self.send_raw_to_all(bytes),
+            Audience::Metering => send_raw_filtered(&self.socket, &self.clients, bytes, |client| {
+                client.metering_enabled
+            }),
+        }
+    }
+
+    /// TEMP, for Studio 0.6.0: the listener has reached sample position `pos`,
+    /// in an embedded host's word for it. The first call starts holding the
+    /// stream until the listener reaches each block; every call sends what it
+    /// now has, in order.
+    pub fn hold_until_heard(&self, pos: u64) {
+        let mut hold = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+        let h = hold.get_or_insert_with(|| Hold::new(pos));
+        h.heard(pos);
+        while let Some((to, bytes)) = h.next_due() {
+            self.send_now(to, &bytes);
+        }
+    }
+
+    /// TEMP: what is held from now on describes the block starting at `pos`.
+    pub fn hold_render_at(&self, pos: u64) {
+        if let Some(h) = self.hold.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            h.render_at(pos);
+        }
+    }
+
+    /// TEMP: the stream's positions start again from 0 (a reset): drop what is
+    /// held about the audio before it, which nobody will hear.
+    pub fn rewind_hold(&self) {
+        if let Some(h) = self.hold.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            h.rewind();
+        }
     }
 
     pub(crate) fn send_to_diag_clients(&self, bytes: &[u8]) {

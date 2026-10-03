@@ -478,7 +478,10 @@ const char *orender_build_id(void);
 //   reported as the audio plays, it reaches OSC clients as
 //   `/omniphony/playout/heard`, so a client such as Studio can show each block
 //   when it is heard rather than when it was rendered. The engine holds
-//   nothing back. A host that never sets it changes nothing.
+//   nothing back. A host that never sets it changes nothing. TEMP in this
+//   fork, for Studio 0.6.0, which shows each block as it arrives: from the
+//   first report on, the engine also holds the stream messages until the
+//   listener reaches their block (see ABI.md, Kodi fork additions).
 int orender_set_option(struct OrenderRenderer *r, const char *key, const char *value);
 
 #ifdef __cplusplus

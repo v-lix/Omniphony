@@ -228,6 +228,12 @@ prepare for it) ignores both. Studio queues the stream messages and applies
 each one once the listener reaches its block, and applies everything else —
 state, replies to an edit — at once.
 
+TEMP in this fork, for Studio 0.6.0, which applies the stream messages as they
+arrive: an embedded engine whose host sets `heard_us` also holds them, each
+block's marker with them, until the listener reaches their block, so 0.6.0
+shows each block when it is heard and a client that follows the sound finds it
+already heard. `/omniphony/playout/heard` is not held.
+
 ### Live State
 
 The control and state surface — every `/omniphony/control/…` address a client
