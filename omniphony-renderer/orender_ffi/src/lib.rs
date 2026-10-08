@@ -142,7 +142,9 @@ pub struct OrenderConfig {
     /// CLI + studio (`~/.config/omniphony/config.yaml`).
     pub config_yaml_path: *const c_char,
     /// Optional speaker-layout YAML path overriding the config. NULL → use the
-    /// config's embedded layout, else the 7.1.4 preset.
+    /// config's embedded layout, else the 7.1.4 preset. A config that renders
+    /// a room (`hrir_source: brir`) is built on the room's loudspeakers
+    /// whatever this says.
     pub speaker_layout_path: *const c_char,
     /// Optional decoder bridge plugins (the `*_bridge.so` files of the input
     /// formats' bridges) overriding the config: one path, or a path list in
@@ -224,8 +226,12 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     relayed to OSC clients as /omniphony/playout/heard).
 // 13: fork additions: orender_decoded_sample_rate, the bridge's actual output
 //     rate so a host can detect a mismatch with its configured session rate;
-//     orender_drain releasing a pending decoder access unit at EOF too; and
-//     orender_hrir_in_use to name the HRIR set the binaural path convolves.
+//     orender_drain releasing a pending decoder access unit at EOF too;
+//     orender_hrir_in_use to name the HRIR set the binaural path convolves
+//     (`brir` while a room does); orender_brir_prepare (carrying the host's
+//     source text in the room) and orender_brir_state for measured rooms; orender_sofa_describe, what a SOFA file or prepared
+//     room holds and which stage takes it; and orender_compose_config for a
+//     host's generated config overridden by a patch its user owns.
 pub const ORENDER_ABI_MINOR: u32 = 13;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -623,6 +629,43 @@ pub unsafe extern "C" fn orender_source_label(
     .unwrap_or(0)
 }
 
+/// Write how the last frames reached the headphones, as a host shows it, as
+/// a NUL-terminated string: `room:N` while a room of `N` loudspeakers
+/// convolves, `cascade:N` while objects are panned onto `N` virtual
+/// loudspeakers for the HRTF stage (a room's own while it loads), `direct`
+/// when each object is convolved as a direction of its own, `speakers:N`
+/// for speaker output. It follows the session, not the host's settings: a
+/// config that chose a room or a mode is reported as rendered. Live, like
+/// `orender_hrir_in_use`.
+///
+/// Query/fill convention as `orender_source_label`: returns the length `N`
+/// without the terminator and writes only when `out` is non-NULL and
+/// `cap > N`. 0 on a NULL handle / error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_render_path(
+    r: *const OrenderRenderer,
+    out: *mut c_char,
+    cap: u32,
+) -> u32 {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return 0;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        let engine = unsafe { &*(r as *const Engine) };
+        let path = engine.render_path();
+        let n = path.len() as u32;
+        if !out.is_null() && cap > n {
+            // SAFETY: non-null, and the caller's buffer holds `cap > n` bytes.
+            let out = unsafe { std::slice::from_raw_parts_mut(out as *mut u8, path.len() + 1) };
+            out[..path.len()].copy_from_slice(path.as_bytes());
+            out[path.len()] = 0;
+        }
+        n
+    }))
+    .unwrap_or(0)
+}
+
 /// Write the selector of the HRIR set the binaural renderer is convolving
 /// with — `saf` (the embedded KEMAR set), `sofa`, `brir`, `synthetic`,
 /// `pinna` or `prtf`, the same words `hrir_source` takes in the config — as a
@@ -632,6 +675,11 @@ pub unsafe extern "C" fn orender_source_label(
 /// and built off the audio thread, so the answer can move from `saf` to
 /// `sofa` a moment into the stream; poll it with the other per-frame queries
 /// rather than latching the first value.
+///
+/// `brir` means the last rendered frame was convolved with a room. While a
+/// room loads, or when it could not be loaded, the HRTF stage renders its
+/// virtual array on the embedded set and this reads `saf`;
+/// `orender_brir_state` tells the two apart.
 ///
 /// Query/fill convention as `orender_source_label`: returns the length `N`
 /// without the terminator and writes only when `out` is non-NULL and
@@ -647,8 +695,13 @@ pub unsafe extern "C" fn orender_hrir_in_use(
             return 0;
         }
         // SAFETY: non-null (checked above) and a live `orender_create` handle.
-        let status = unsafe { &*(r as *const Engine) }.hrir_status();
-        let name = status.effective.as_str().as_bytes();
+        let engine = unsafe { &*(r as *const Engine) };
+        let status = engine.hrir_status();
+        let name = if engine.brir_rendering() {
+            "brir".as_bytes()
+        } else {
+            status.effective.as_str().as_bytes()
+        };
         let n = name.len() as u32;
         if !out.is_null() && cap > n {
             // SAFETY: non-null, and the caller's buffer holds `cap > n` bytes.
@@ -659,6 +712,356 @@ pub unsafe extern "C" fn orender_hrir_in_use(
         n
     }))
     .unwrap_or(0)
+}
+
+/// Where the headphone session's room (a `brir` HRIR source) stands: 0 no
+/// room selected (or the output is not binaural), 1 loading, 2 resident, 3
+/// refused — the reason is in the log. While it loads and after it is
+/// refused, the HRTF stage renders the virtual array on the embedded set
+/// (`orender_hrir_in_use` reads `saf`). Live, like `orender_hrir_in_use`: a
+/// room is requested with the first rendered block and loaded off the audio
+/// thread. -1 on a NULL handle or an internal error.
+///
+/// # Safety
+/// `r` is NULL or a live `orender_create` handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_brir_state(r: *const OrenderRenderer) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if r.is_null() {
+            return -1;
+        }
+        // SAFETY: non-null (checked above) and a live `orender_create` handle.
+        unsafe { &*(r as *const Engine) }.brir_state() as c_int
+    }))
+    .unwrap_or(-1)
+}
+
+/// Write `text` into a caller's buffer of `cap` bytes, NUL-terminated and cut
+/// at a character boundary when it does not fit. Nothing for a NULL buffer
+/// or a zero capacity.
+///
+/// # Safety
+/// `out` is NULL or holds `cap` writable bytes.
+unsafe fn write_text(out: *mut c_char, cap: u32, text: &str) {
+    if out.is_null() || cap == 0 {
+        return;
+    }
+    let mut n = text.len().min(cap as usize - 1);
+    while !text.is_char_boundary(n) {
+        n -= 1;
+    }
+    // SAFETY: non-null, and the caller's buffer holds `cap > n` bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(out as *mut u8, n + 1) };
+    out[..n].copy_from_slice(&text.as_bytes()[..n]);
+    out[n] = 0;
+}
+
+/// Prepare a measured room for this engine, once, so a session loads it in a
+/// fraction of the time and memory the SOFA file takes.
+///
+/// `sofa` holds `len` bytes of a room-response SOFA file (`MultiSpeakerBRIR`,
+/// or a per-direction set with room-length responses). The head orientation
+/// nearest straight ahead is kept, which is what a session without head
+/// tracking renders, and the result is checked to load and to make a speaker
+/// layout. It is written to `out_path` through `out_path.part`, renamed into
+/// place, so a failure leaves any previous file there untouched.
+///
+/// A session given the prepared file as its `brir_sofa_path` renders it
+/// exactly as it renders the SOFA file without head tracking, and builds its
+/// virtual array on the room's loudspeakers from the start.
+///
+/// `source` is a text of the host's carried in the prepared room: what the
+/// room was made from, in whatever form the host compares later - the
+/// file's path, size and time, say. The engine stores it verbatim, cut
+/// to 4096 bytes, and never interprets it; a host reads it back from the
+/// room's header (see ABI.md) to tell whether a room already there is the
+/// one this file would prepare, with no note beside it.
+///
+/// `summary` (NULL allowed) receives a NUL-terminated line, cut to `cap`
+/// bytes. On success: `emitters=13 orientations=1 seconds=0.512 rate=48000
+/// bytes=1712345 names=C,FL,FR,… conventions=MultiSpeakerBRIR` (conventions
+/// last, spaces in it replaced by `_`). On failure: the reason.
+///
+/// Returns 0 on success, -1 when the bytes are not a usable room response
+/// (or this build has no SOFA support), -2 when the prepared file cannot be
+/// written, -3 on a NULL argument (a `source` that is not UTF-8 included) or
+/// an internal error.
+///
+/// # Safety
+/// `sofa` holds `len` readable bytes; `out_path` is a NUL-terminated path;
+/// `source` is a NUL-terminated UTF-8 string; `summary` is NULL or holds
+/// `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_brir_prepare(
+    sofa: *const u8,
+    len: usize,
+    out_path: *const c_char,
+    source: *const c_char,
+    summary: *mut c_char,
+    cap: u32,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a nul-terminated string (caller contract).
+        let Some(source) = (unsafe { opt_str(source) }) else {
+            unsafe { write_text(summary, cap, "no source text, or not UTF-8") };
+            return -3;
+        };
+        // SAFETY: NULL or a nul-terminated string (caller contract).
+        let Some(out_path) = (unsafe { opt_str(out_path) }) else {
+            unsafe { write_text(summary, cap, "no output path") };
+            return -3;
+        };
+        if sofa.is_null() {
+            unsafe { write_text(summary, cap, "no input") };
+            return -3;
+        }
+        // SAFETY: non-null, and the caller's buffer holds `len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(sofa, len) };
+        match prepare_room_file(bytes, Path::new(out_path), source) {
+            Ok(line) => {
+                unsafe { write_text(summary, cap, &line) };
+                0
+            }
+            Err((code, reason)) => {
+                unsafe { write_text(summary, cap, &reason) };
+                code
+            }
+        }
+    }))
+    .unwrap_or(-3)
+}
+
+/// [`orender_brir_prepare`] on safe types: the summary line, or the return
+/// code and the reason.
+#[cfg(feature = "sofa")]
+fn prepare_room_file(
+    bytes: &[u8],
+    out: &Path,
+    source: &str,
+) -> std::result::Result<String, (c_int, String)> {
+    let mut prepared =
+        renderer::binaural::brir::prepare_room(bytes).map_err(|e| (-1, format!("{e:#}")))?;
+    prepared.room = prepared.room.with_source(source);
+    let image = prepared.room.to_prepared();
+    let mut part = out.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    std::fs::write(&part, &image)
+        .and_then(|()| std::fs::rename(&part, out))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            (-2, format!("write {}: {e}", out.display()))
+        })?;
+    let room = &prepared.room;
+    Ok(format!(
+        "emitters={} orientations={} seconds={:.3} rate={} bytes={} names={} conventions={}",
+        room.emitters().len(),
+        room.orientations().len(),
+        prepared.seconds,
+        room.file_rate(),
+        image.len(),
+        prepared.speaker_names.join(","),
+        room.conventions().replace(char::is_whitespace, "_"),
+    ))
+}
+
+#[cfg(not(feature = "sofa"))]
+fn prepare_room_file(
+    _bytes: &[u8],
+    _out: &Path,
+    _source: &str,
+) -> std::result::Result<String, (c_int, String)> {
+    Err((
+        -1,
+        "SOFA support is not built into this library (the 'sofa' feature)".to_string(),
+    ))
+}
+
+/// Say what a SOFA file or a prepared room holds, and which binaural stage
+/// takes it, before a host copies or prepares anything: its shape and
+/// geometry are read, never its responses, so a room set of hundreds of MB
+/// is described in a moment.
+///
+/// `sofa` holds `len` bytes of the file. `out` (NULL allowed) receives a
+/// NUL-terminated line, cut to `cap` bytes:
+/// `hrtf=yes|no room=yes|no prepared=yes|no conventions=… measurements=M
+/// receivers=R emitters=E samples=N rate=…`, then, for a room,
+/// `orientations=… speakers=S names=C,FL,FR,…`, and `reason=…` to the end
+/// of the line: why the stage that does not take the file refuses it (the
+/// HRTF stage's reason for a file that suits neither and holds one emitter
+/// per measurement, the room stage's otherwise). Spaces in `conventions` are
+/// replaced by `_`.
+///
+/// The HRTF stage (`hrtf_sofa_path`) takes one direction per measurement
+/// and convolves the first few milliseconds of each; the room stage
+/// (`brir_sofa_path`, or `orender_brir_prepare`) takes up to 64 loudspeakers
+/// measured with their room. A multi-speaker room suits only the second, a
+/// free-field set of hundreds of directions only the first.
+///
+/// Returns 1 when the HRTF stage takes the file, 2 when the room stage does,
+/// 3 when both do, 0 when neither does (the reason is in `out`), -1 when the
+/// bytes are neither a SOFA file this engine reads nor a prepared room, -3
+/// on a NULL `sofa` or an internal error.
+///
+/// # Safety
+/// `sofa` holds `len` readable bytes; `out` is NULL or holds `cap` writable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_sofa_describe(
+    sofa: *const u8,
+    len: usize,
+    out: *mut c_char,
+    cap: u32,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        if sofa.is_null() {
+            unsafe { write_text(out, cap, "reason=no input") };
+            return -3;
+        }
+        // SAFETY: non-null, and the caller's buffer holds `len` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(sofa, len) };
+        match renderer::binaural::brir::describe_room_file(bytes) {
+            Ok(contents) => {
+                let (line, code) = describe_line(&contents);
+                unsafe { write_text(out, cap, &line) };
+                code
+            }
+            Err(e) => {
+                unsafe { write_text(out, cap, &format!("reason={e:#}")) };
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-3)
+}
+
+/// [`orender_sofa_describe`]'s line and return code for `c`.
+fn describe_line(c: &renderer::binaural::brir::SofaContents) -> (String, c_int) {
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let hrtf = c.hrtf_refusal.is_none();
+    let room = c.room.as_ref().ok();
+    let mut line = format!(
+        "hrtf={} room={} prepared={} conventions={} measurements={} receivers={} emitters={} \
+         samples={} rate={}",
+        yes(hrtf),
+        yes(room.is_some()),
+        yes(c.prepared),
+        c.conventions.replace(char::is_whitespace, "_"),
+        c.measurements,
+        c.receivers,
+        c.emitters,
+        c.samples,
+        c.rate,
+    );
+    if let Some(room) = room {
+        line += &format!(
+            " orientations={} speakers={} names={}",
+            room.orientations,
+            room.speakers.len(),
+            room.speakers.join(",")
+        );
+    }
+    let reason = match (&c.hrtf_refusal, &c.room) {
+        (Some(why), Err(_)) if c.emitters == 1 => Some(why.as_str()),
+        (_, Err(why)) => Some(why.as_str()),
+        (Some(why), Ok(_)) => Some(why.as_str()),
+        (None, Ok(_)) => None,
+    };
+    if let Some(reason) = reason {
+        line += &format!(" reason={reason}");
+    }
+    let code = c_int::from(hrtf) | if room.is_some() { 2 } else { 0 };
+    (line, code)
+}
+
+/// Compose a host's generated config with a patch its user owns, for a host
+/// that writes the config itself and lets an advanced user override it.
+///
+/// `base_path` is the host's config for this session; `patch_path` the
+/// user's partial config (absent = no patch); `patch_dir` the directory the
+/// patch's relative paths start in (NULL = the patch's own). In the patch,
+/// `null` inherits the host's value, mappings merge key by key and anything
+/// else replaces; it is applied whole or not at all, and a key the host owns
+/// (the decoder, input, output, OSC) is refused rather than ignored. The
+/// patch is only read, never written.
+///
+/// When the patch applies, the composed config is written to `out_path`
+/// (through `out_path.part`, renamed into place) for `orender_create` -
+/// unless `out_path` already holds exactly that text, which is left as it
+/// is: a host can keep the composed config between sessions, and it is
+/// rewritten only when the base or the patch changes what it says.
+///
+/// `report` (NULL allowed) receives a NUL-terminated line, cut to `cap`
+/// bytes: `status=none|applied|rejected keys=N layout_set=0|1
+/// decode_thread_set=0|1`, and `reason=…` to the end of the line when
+/// rejected. `layout_set`: the patch sets `current_layout`, so a host that
+/// also passes `speaker_layout_path` must not, or it would win.
+/// `decode_thread_set`: the patch sets `decode_thread`, so a host that picks
+/// the decode thread itself should hand the choice to the option instead
+/// (`orender_set_option(r, "decode_thread", "live")`).
+///
+/// Returns 1 when the patch applies (`out_path` holds it), 0 when there is no
+/// patch or it sets nothing (nothing written: use `base_path`), -1 when the
+/// patch is rejected (nothing written: use `base_path`), -2 when the
+/// composed config cannot be written, -3 on a NULL argument or an internal
+/// error.
+///
+/// # Safety
+/// `base_path`, `patch_path` and `out_path` are NUL-terminated paths;
+/// `patch_dir` is NULL or one; `report` is NULL or holds `cap` writable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_compose_config(
+    base_path: *const c_char,
+    patch_path: *const c_char,
+    patch_dir: *const c_char,
+    out_path: *const c_char,
+    report: *mut c_char,
+    cap: u32,
+) -> c_int {
+    use renderer::config::compose::{ComposeStatus, compose_files};
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or nul-terminated strings (caller contract).
+        let (Some(base), Some(patch), Some(out)) = (unsafe { opt_str(base_path) }, unsafe {
+            opt_str(patch_path)
+        }, unsafe {
+            opt_str(out_path)
+        }) else {
+            unsafe { write_text(report, cap, "status=rejected keys=0 layout_set=0 decode_thread_set=0 reason=a path is missing") };
+            return -3;
+        };
+        let dir = unsafe { opt_str(patch_dir) }.map(Path::new);
+        let composed = compose_files(Path::new(base), Path::new(patch), dir);
+        let code = match composed.status {
+            ComposeStatus::None => 0,
+            ComposeStatus::Rejected => -1,
+            ComposeStatus::Applied => {
+                let text = composed.effective.as_deref().unwrap_or_default();
+                if std::fs::read(out).is_ok_and(|held| held == text.as_bytes()) {
+                    unsafe { write_text(report, cap, &composed.line()) };
+                    return 1;
+                }
+                let mut part = std::ffi::OsString::from(out);
+                part.push(".part");
+                let part = PathBuf::from(part);
+                match std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, out)) {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&part);
+                        let line = format!(
+                            "{} reason=cannot write {out}: {e}",
+                            composed.line().replacen("status=applied", "status=rejected", 1)
+                        );
+                        unsafe { write_text(report, cap, &line) };
+                        return -2;
+                    }
+                }
+            }
+        };
+        unsafe { write_text(report, cap, &composed.line()) };
+        code
+    }))
+    .unwrap_or(-3)
 }
 
 /// Constant DSP latency of the rendered output, in samples at the engine
@@ -1757,5 +2160,54 @@ mod degraded_reporter_tests {
         stop_degraded_reporter_global();
         assert!(DEGRADED_REPORTER.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::describe_line;
+    use renderer::binaural::brir::{RoomContents, SofaContents};
+
+    fn contents(hrtf: Option<&str>, room: Result<usize, &str>, emitters: usize) -> SofaContents {
+        SofaContents {
+            conventions: "Some Convention".to_string(),
+            prepared: false,
+            rate: 44100,
+            measurements: 5,
+            receivers: 2,
+            emitters,
+            samples: 9600,
+            hrtf_refusal: hrtf.map(str::to_string),
+            room: room
+                .map(|n| RoomContents {
+                    speakers: (0..n).map(|i| format!("E{}", i + 1)).collect(),
+                    orientations: 1,
+                })
+                .map_err(str::to_string),
+        }
+    }
+
+    /// A few room-length responses, one direction each, suit both stages,
+    /// with no reason; each refusal is the one a host needs for the stage
+    /// the file does not suit.
+    #[test]
+    fn the_line_names_both_stages_and_the_reason_that_matters() {
+        let (line, code) = describe_line(&contents(None, Ok(2), 1));
+        assert_eq!(code, 3);
+        assert_eq!(
+            line,
+            "hrtf=yes room=yes prepared=no conventions=Some_Convention measurements=5 \
+             receivers=2 emitters=1 samples=9600 rate=44100 orientations=1 speakers=2 names=E1,E2"
+        );
+
+        let (line, code) = describe_line(&contents(Some("no ears"), Err("no room"), 1));
+        assert_eq!(code, 0);
+        assert!(line.ends_with(" reason=no ears"), "{line}");
+        let (line, code) = describe_line(&contents(Some("no ears"), Err("no room"), 4));
+        assert_eq!(code, 0);
+        assert!(line.ends_with(" reason=no room"), "{line}");
+        let (line, code) = describe_line(&contents(None, Err("too many"), 1));
+        assert_eq!(code, 1);
+        assert!(line.ends_with(" reason=too many"), "{line}");
     }
 }

@@ -80,6 +80,22 @@ pub const BRIR_LADDER: [usize; 4] = [BRIR_BLOCK, 512, 2048, 8192];
 /// above which the mapping is logged as a mismatch, degrees.
 const MISMATCH_WARN_DEG: f32 = 10.0;
 
+/// Where a headphone session's room stands
+/// ([`crate::live_params::RendererControl::brir_state`]). The discriminants
+/// are the C ABI's `orender_brir_state` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum BrirState {
+    /// No room selected (or the output is not the headphones).
+    None = 0,
+    /// Selected, not resident yet: the HRTF stage renders meanwhile.
+    Loading = 1,
+    /// Resident.
+    Ready = 2,
+    /// Refused; the HRTF stage renders instead.
+    Failed = 3,
+}
+
 /// What the last BRIR load produced, for the control surface.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BrirStatus {
@@ -438,17 +454,13 @@ impl BrirStage {
         }
     }
 
-    #[cfg(feature = "sofa")]
+    /// A prepared room or a SOFA file ([`BrirSet::load`]); without the
+    /// `sofa` feature only a prepared room loads.
     fn load(key: &LoadKey, sample_rate: u32) -> Result<BrirSet, String> {
         if key.path.trim().is_empty() {
             return Err("no BRIR file selected".to_string());
         }
-        BrirSet::from_sofa(&key.path, sample_rate, &key.opts).map_err(|e| e.to_string())
-    }
-
-    #[cfg(not(feature = "sofa"))]
-    fn load(_key: &LoadKey, _sample_rate: u32) -> Result<BrirSet, String> {
-        Err("SOFA support not built into this renderer (enable the 'sofa' feature)".to_string())
+        BrirSet::load(&key.path, sample_rate, &key.opts).map_err(|e| e.to_string())
     }
 
     /// Engine rate the stage was built for.
@@ -683,6 +695,37 @@ impl BrirStage {
             self.fifo.fill(0.0);
             self.read_pos = 0;
         }
+    }
+
+    /// Silence the stage in place, as a fresh load's streams start: every
+    /// bus history, every tail segment and the output block. The set, its
+    /// bank and the bus mapping stay. What a seek needs: the room's tail of
+    /// what played before must not ring on into what plays next. Nothing
+    /// allocates but the retirement of a bank swap still in flight.
+    pub fn clear_history(&mut self) {
+        for input in &mut self.streams.inputs {
+            input.reset();
+        }
+        self.streams.tails.reset();
+        if let Some(bank) = self.bank.as_ref() {
+            for banks in &mut self.streams.tail_banks {
+                if let Some(old) = banks.outgoing.take() {
+                    let _ = self.request_tx.send(Request::Drop(Box::new(old)));
+                }
+                if !Arc::ptr_eq(&banks.current, bank) {
+                    let old = std::mem::replace(&mut banks.current, Arc::clone(bank));
+                    let _ = self.request_tx.send(Request::Drop(Box::new(old)));
+                }
+            }
+        }
+        if let Some(old) = self.fade_from.take() {
+            self.retire(Box::new(old));
+        }
+        for scratch in &mut self.scratch {
+            scratch.clear();
+        }
+        self.fifo.fill(0.0);
+        self.read_pos = 0;
     }
 
     /// Per bus: the emitter it is rendered from (`None` = direct).
@@ -946,6 +989,7 @@ pub(crate) mod test_support {
             listener_position: &[0.0, 0.0, 0.0],
             listener_view: &view,
             data_ir: &ir,
+            ir_first: 0,
             data_delay: &[],
         };
         let opts = BrirLoadOptions {
@@ -1320,6 +1364,56 @@ mod tests {
             let mut stage = stage_on(&BRIR_LADDER, &set, &positions, &direct);
             let got = render(&mut stage, &signal, 3, frame, HeadPose::identity());
             assert!(got == want, "frames of {frame} samples changed the output");
+        }
+    }
+
+    /// A cleared stage is the stage fresh from its load: whatever it rendered
+    /// before, the next signal comes out bit for bit as a stage that never
+    /// heard anything renders it, through every level of the ladder, and
+    /// silence comes out as silence. Cleared mid-block too: a seek does not
+    /// wait for a block boundary.
+    #[test]
+    fn a_cleared_stage_renders_as_a_fresh_one() {
+        let (positions, direct) = ring_buses(3, &[2]);
+        let taps = 30_000;
+        let set = noise_set(&positions, &[taps; 3], &[0.0], 3);
+        let signal = noise(3 * (taps + 2 * 8192), 0x1234_5678);
+        let mut fresh = stage_on(&BRIR_LADDER, &set, &positions, &direct);
+        assert_eq!(fresh.plan.levels_for(taps), BRIR_LADDER.len());
+        let want = render(&mut fresh, &signal, 3, 40, HeadPose::identity());
+        assert!(want.0.iter().any(|&v| v != 0.0));
+
+        for before in [3 * 40, 3 * (2 * 8192 + 77)] {
+            let mut stage = stage_on(&BRIR_LADDER, &set, &positions, &direct);
+            render(
+                &mut stage,
+                &noise(before, 0x0bad_cafe),
+                3,
+                40,
+                HeadPose::identity(),
+            );
+            stage.clear_history();
+            let got = render(&mut stage, &signal, 3, 40, HeadPose::identity());
+            assert!(
+                got == want,
+                "{} samples before the clear changed the output",
+                before / 3
+            );
+
+            render(
+                &mut stage,
+                &noise(before, 0x0bad_cafe),
+                3,
+                40,
+                HeadPose::identity(),
+            );
+            stage.clear_history();
+            let silence = vec![0.0f32; 3 * (taps + 8192)];
+            let (l, r) = render(&mut stage, &silence, 3, 40, HeadPose::identity());
+            assert!(
+                l.iter().chain(&r).all(|&v| v == 0.0),
+                "the tail of what played before the clear rang on"
+            );
         }
     }
 

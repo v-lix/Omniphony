@@ -69,6 +69,12 @@ fn demo() -> Vec<u8> {
 }
 
 fn session() -> Session {
+    session_with(|_| String::new())
+}
+
+/// A session whose config also holds what `render` returns: lines of the
+/// `render:` section, written after the session's directory exists.
+fn session_with(render: impl FnOnce(&Path) -> String) -> Session {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let lock = SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
@@ -78,10 +84,13 @@ fn session() -> Session {
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let config_path = dir.join("config.yaml");
+    let extra = render(&dir);
     std::fs::write(
         &config_path,
-        "render:\n  osc: false\n  evaluation_cartesian_x_size: 9\n  \
-         evaluation_cartesian_y_size: 9\n  evaluation_cartesian_z_size: 5\n",
+        format!(
+            "render:\n  osc: false\n  evaluation_cartesian_x_size: 9\n  \
+             evaluation_cartesian_y_size: 9\n  evaluation_cartesian_z_size: 5\n{extra}"
+        ),
     )
     .expect("write config");
     let config = CString::new(config_path.to_str().expect("utf-8 path")).unwrap();
@@ -401,5 +410,76 @@ fn sessions_can_be_created_and_destroyed_in_turn() {
     unsafe {
         orender_destroy(ptr::null_mut());
         assert!(orender_create(ptr::null()).is_null());
+    }
+}
+
+/// A session on a prepared room: built on its loudspeakers, it reports the
+/// room loading, then resident, and names `brir` as the set convolved once a
+/// frame went through it. NULL handles answer -1 and 0.
+#[test]
+fn a_room_is_named_once_it_convolves() {
+    // SAFETY: NULL handles, which the entry points refuse.
+    unsafe {
+        assert_eq!(orender_brir_state(ptr::null()), -1);
+        assert_eq!(orender_hrir_in_use(ptr::null(), ptr::null_mut(), 0), 0);
+    }
+    let plain = session();
+    // SAFETY: a live handle.
+    assert_eq!(
+        unsafe { orender_brir_state(plain.handle) },
+        0,
+        "no room selected"
+    );
+    drop(plain);
+
+    let s = session_with(|dir| {
+        let sofa = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../renderer/tests/sofa/chunked_multispeaker_brir.sofa"),
+        )
+        .expect("fixture");
+        let room = dir.join("brir.room");
+        let path = CString::new(room.to_str().unwrap()).unwrap();
+        let source = CString::new("chunked_multispeaker_brir.sofa").unwrap();
+        // SAFETY: the fixture's bytes, a nul-terminated path and source; no
+        // summary.
+        let code = unsafe {
+            orender_brir_prepare(
+                sofa.as_ptr(),
+                sofa.len(),
+                path.as_ptr(),
+                source.as_ptr(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(code, 0);
+        format!(
+            "  binaural:\n    output_mode: binaural\n    hrir_source: brir\n    \
+             brir_sofa_path: '{}'\n",
+            room.display()
+        )
+    });
+    // SAFETY (the block): a live handle and a buffer valid for its length.
+    unsafe {
+        assert_eq!(orender_channel_count(s.handle), 2, "binaural out");
+        assert_eq!(orender_brir_state(s.handle), 1, "asked for, not loaded");
+        let data = demo();
+        let mut out = Vec::new();
+        let mut name = String::new();
+        for p in data.chunks(4096).cycle().take(2000) {
+            assert_eq!(process(&s, p, &mut out, 1 << 16).code, 0);
+            let mut buf = [0 as c_char; 16];
+            orender_hrir_in_use(s.handle, buf.as_mut_ptr(), 16);
+            name = std::ffi::CStr::from_ptr(buf.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            if name == "brir" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(name, "brir");
+        assert_eq!(orender_brir_state(s.handle), 2);
     }
 }

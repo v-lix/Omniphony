@@ -57,9 +57,9 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 # The `sofar` fork patched in by the workspace manifest ([patch.crates-io]:
-# netCDF4 variables and chunked N-d datasets, issues #185 and #219). Drop it
-# here when the patch goes.
-allow-git = ["https://github.com/mgth/sofar"]
+# netCDF4 variables and chunked N-d datasets, issues #185 and #219, and the
+# reading of a room's measurements alone). Drop it here when the patch goes.
+allow-git = ["https://github.com/v-lix/sofar"]
 
 [licenses]
 confidence-threshold = 0.93

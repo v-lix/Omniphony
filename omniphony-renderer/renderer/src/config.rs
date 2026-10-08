@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 
+pub mod compose;
 pub(crate) mod unknown_values;
 
 use unknown_values::{EnumKey, KeepsUnknownValues};
@@ -464,6 +465,58 @@ pub struct BinauralConfig {
     /// See `Config::extra` — preserve unknown keys through round-trips.
     #[serde(flatten, default, skip_serializing_if = "Mapping::is_empty")]
     pub extra: Mapping,
+}
+
+impl BinauralConfig {
+    /// The HRIR source this section selects, the way a session reads it: a
+    /// bare `sofa` or `brir` takes its file from `hrtf_sofa_path` or
+    /// `brir_sofa_path` and falls back to the embedded KEMAR set without
+    /// one; `sofa:<path>` and `brir:<path>` carry their own. `None` when the
+    /// section selects nothing (or nothing this build knows), which leaves
+    /// the source as it was.
+    pub fn effective_hrir_source(&self) -> Option<crate::binaural::HrirSource> {
+        use crate::binaural::HrirSource;
+        let source = self.hrir_source.as_deref().and_then(HrirSource::from_str)?;
+        let file = |path: Option<&PathBuf>| path.map(|p| p.to_string_lossy().into_owned());
+        Some(match source {
+            HrirSource::Sofa(p) if p.is_empty() => {
+                file(self.hrtf_sofa_path.as_ref()).map_or(HrirSource::SafKemar, HrirSource::Sofa)
+            }
+            HrirSource::Brir(p) if p.is_empty() => {
+                file(self.brir_sofa_path.as_ref()).map_or(HrirSource::SafKemar, HrirSource::Brir)
+            }
+            other => other,
+        })
+    }
+
+    /// The loudspeakers of the room a headphone session with this section
+    /// renders, and its corners where the file states them, when it selects
+    /// one: the output is binaural and the source a
+    /// room, prepared ([`crate::binaural::brir::prepare_room`], read from its
+    /// header) or a SOFA file (from its geometry). They are the virtual array
+    /// a session is built on before the room loads. `None` for anything
+    /// else, including a room whose loudspeakers cannot be had (the load
+    /// then reports why).
+    pub fn room_loudspeakers(&self) -> Option<crate::binaural::brir::RoomLoudspeakers> {
+        let binaural = self
+            .output_mode
+            .as_deref()
+            .and_then(crate::live_params::OutputMode::from_str)
+            == Some(crate::live_params::OutputMode::Binaural);
+        if !binaural {
+            return None;
+        }
+        let crate::binaural::HrirSource::Brir(path) = self.effective_hrir_source()? else {
+            return None;
+        };
+        match crate::binaural::brir::room_loudspeakers(Path::new(&path)) {
+            Ok(room) => room,
+            Err(e) => {
+                log::warn!("binaural: room '{path}': {e:#}");
+                None
+            }
+        }
+    }
 }
 
 /// `render.binaural.reverb`: late-reverb (FDN) tail of the binaural stage.

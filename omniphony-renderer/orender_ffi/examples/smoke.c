@@ -32,6 +32,14 @@ int main(void) {
 
     if (orender_decoded_sample_rate(NULL) != 0) { puts("FAIL: decoded rate for NULL"); return 10; }
     if (orender_hrir_in_use(NULL, NULL, 0) != 0) { puts("FAIL: HRIR set for NULL"); return 13; }
+    if (orender_brir_state(NULL) != -1) { puts("FAIL: room state for NULL"); return 14; }
+    if (orender_render_path(NULL, NULL, 0) != 0) { puts("FAIL: render path for NULL"); return 18; }
+    if (orender_brir_prepare(NULL, 0, NULL, NULL, NULL, 0) != -3) { puts("FAIL: prepare(NULL)"); return 15; }
+    if (orender_compose_config(NULL, NULL, NULL, NULL, NULL, 0) != -3) {
+        puts("FAIL: compose(NULL)");
+        return 16;
+    }
+    if (orender_sofa_describe(NULL, 0, NULL, 0) != -3) { puts("FAIL: describe(NULL)"); return 17; }
 
     /* Build id is static and never NULL. */
     const char *build_id = orender_build_id();

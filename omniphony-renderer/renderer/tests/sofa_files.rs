@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use renderer::binaural::brir::{BrirLoadOptions, BrirSet};
+use renderer::binaural::brir::{BrirLoadOptions, BrirSet, ExtractedRoom, prepare_room};
 use renderer::binaural::hrir::{HRIR_LEN, HrirPair, HrirSet};
 use renderer::binaural::measured::hrir_set_from_sofa;
 
@@ -266,7 +266,55 @@ fn damaged_copies_of_valid_files_are_loaded_or_refused() {
             let path = dir.join(format!("damaged-{case}.sofa"));
             std::fs::write(&path, &damaged).unwrap();
             load_or_refuse(&path, &what);
+            // Preparing reads the same bytes: a room or a reason, no panic.
+            if let Ok(prepared) = prepare_room(&damaged) {
+                let back = ExtractedRoom::from_prepared(&prepared.room.to_prepared())
+                    .unwrap_or_else(|e| panic!("{what}: prepared bytes refused: {e}"));
+                assert_eq!(back, prepared.room, "{what}");
+            }
         }
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A measured room prepared for a host loads, through the host's entry
+/// point, exactly as the file does: same loudspeakers, same pairs. The
+/// summary a host shows names the loudspeakers and the kept length.
+#[test]
+fn a_prepared_room_loads_exactly_as_its_sofa_file_does() {
+    let path = fixture("chunked_multispeaker_brir.sofa");
+    let prepared = prepare_room(&std::fs::read(&path).unwrap()).expect("prepares");
+    assert_eq!(prepared.room.conventions(), "MultiSpeakerBRIR");
+    assert_eq!(prepared.room.emitters().len(), 3);
+    assert_eq!(prepared.speaker_names.len(), 3);
+    assert!(prepared.seconds > 0.0);
+
+    let dir = std::env::temp_dir().join(format!("orender-prepared-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("room.prepared");
+    std::fs::write(&out, prepared.room.to_prepared()).unwrap();
+    let opts = BrirLoadOptions::default();
+    let from_prepared = BrirSet::load(path_str(&out), RATE, &opts).expect("loads");
+    let from_file = BrirSet::load(path_str(&path), RATE, &opts).expect("loads");
+    assert_eq!(from_prepared.emitters(), from_file.emitters());
+    assert_eq!(from_prepared.orientations(), from_file.orientations());
+    assert_eq!(from_prepared.max_taps(), from_file.max_taps());
+    for e in 0..3 {
+        assert_eq!(
+            from_prepared.pair(e, 0),
+            from_file.pair(e, 0),
+            "emitter {e}"
+        );
+    }
+    assert!(finite_brir(&from_prepared));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A free-field HRTF set is not a listening room: its hundreds of
+/// directions are refused with that hint rather than prepared as
+/// loudspeakers.
+#[test]
+fn a_free_field_hrtf_set_is_not_prepared_as_a_room() {
+    let err = prepare_room(&std::fs::read(fixture("Pulse.sofa")).unwrap()).expect_err("refused");
+    assert!(err.to_string().contains("HRTF"), "{err}");
 }

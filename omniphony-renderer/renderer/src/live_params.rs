@@ -1774,6 +1774,10 @@ pub struct RendererControl {
     /// Width the speaker stage was opened with (0 until a renderer reports
     /// it): a BRIR layout wider than this cannot be installed.
     speaker_stage_width: std::sync::atomic::AtomicUsize,
+    /// Whether the last rendered frame went through the BRIR stage: a
+    /// resident set convolved the virtual speakers, rather than the HRTF
+    /// stage standing in while the set loads or after it failed.
+    brir_rendering: AtomicBool,
     /// A host rebuilds the topology when [`Self::render_layout_outdated`]
     /// says so (the OSC listener, which also tells its clients). While
     /// `false`, the renderer's own layout follower does it.
@@ -1990,6 +1994,7 @@ impl RendererControl {
             brir_status_generation: std::sync::atomic::AtomicU64::new(0),
             render_layout_key: std::sync::atomic::AtomicU64::new(0),
             speaker_stage_width: std::sync::atomic::AtomicUsize::new(0),
+            brir_rendering: AtomicBool::new(false),
             relayout_by_host: AtomicBool::new(false),
             object_params_generation: std::sync::atomic::AtomicU64::new(1),
             speaker_params_generation: std::sync::atomic::AtomicU64::new(1),
@@ -2550,6 +2555,47 @@ impl RendererControl {
     /// Record the width the speaker stage was opened with (see the field).
     pub fn set_speaker_stage_width(&self, width: usize) {
         self.speaker_stage_width.store(width, Ordering::Relaxed);
+    }
+
+    /// Whether the last rendered frame went through the BRIR stage (see the
+    /// field): what a host reports as the response in use.
+    pub fn brir_rendering(&self) -> bool {
+        self.brir_rendering.load(Ordering::Relaxed)
+    }
+
+    /// Record whether this frame went through the BRIR stage (the render
+    /// thread, once per frame).
+    pub(crate) fn set_brir_rendering(&self, on: bool) {
+        self.brir_rendering.store(on, Ordering::Relaxed);
+    }
+
+    /// Where a headphone session's room stands: none selected, loading,
+    /// resident, or refused (the reason is in [`Self::binaural_brir_status`]
+    /// and the log). Follows the live source, so a room selected over OSC or
+    /// the config is reported the same way.
+    pub fn brir_state(&self) -> crate::binaural::BrirState {
+        use crate::binaural::BrirState;
+        let path = {
+            let live = self.live.read();
+            match &live.binaural.hrir_source {
+                crate::binaural::HrirSource::Brir(path)
+                    if live.binaural.output_mode == OutputMode::Binaural =>
+                {
+                    path.clone()
+                }
+                _ => return BrirState::None,
+            }
+        };
+        let status = self.binaural_brir_status();
+        if status.path != path {
+            // Asked for, not answered yet.
+            return BrirState::Loading;
+        }
+        match (&status.loaded, &status.error) {
+            (_, Some(_)) => BrirState::Failed,
+            (Some(_), None) => BrirState::Ready,
+            (None, None) => BrirState::Loading,
+        }
     }
 
     /// The layout a headphone render with a BRIR source pans onto, when one

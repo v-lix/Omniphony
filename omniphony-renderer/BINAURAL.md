@@ -239,6 +239,28 @@ How it renders:
   the room is chosen. The state snapshot's `binaural.modeEffective` says
   which path renders.
 
+### Prepared rooms
+
+A measured set is large, and when nothing tracks the head only one
+orientation of it is rendered. The loader reads the file's geometry first,
+then only the measurements the kept orientations come from: the BBC 7.1.4
+set below loads its front orientation in about 0.6 s on x86, its memory the
+file's own size, where every orientation takes 3.6 s and 1.15 GB. A host
+can still do that once, when the room is chosen, with
+`orender_brir_prepare` (see ABI.md) or `renderer::binaural::brir::prepare_room`:
+the result keeps the orientation nearest straight ahead and the responses as
+measured (up to 10 s past their common lead), a few megabytes, and
+`brir_sofa_path` takes it in place of the SOFA file. Name it after its file
+with a `.room` extension (`bbcrdlr_systemG.room`): it is not a SOFA file,
+and the loader tells the two apart by content. It also carries a text of the
+host's naming what it was made from, so a host can tell from the room
+alone whether it is the one a file would prepare. It renders exactly as the
+file does without head tracking, loads in milliseconds, and the session is
+built on the room's loudspeakers from the start, so a room with more
+loudspeakers than the 7.1.4 layout still renders on its own. A session
+given the SOFA file itself is built on them too, from the file's geometry,
+and a room's loudspeakers come before any layout a host names.
+
 ### Where to get one
 
 - **BBC R&D listening room** ([bbcrd-brirs](https://github.com/bbc/bbcrd-brirs),
@@ -250,8 +272,9 @@ How it renders:
   every 7.1.4 position and more, 274 MB) is the one for a 7.1.4 or 9.1.4
   layout; `systemD` (4+5+0, 190 MB) for 5.1.4, `systemB` (0+5+0) for 5.1,
   `all_speakers` (674 MB) for anything else. Loaded with head tracking it
-  holds about 280 MB of responses (0.33 s each after the tail cut), 1.6 MB
-  without; the reader needs about 1.1 GB while parsing the file.
+  holds about 280 MB of responses (0.33 s each after the tail cut) and
+  needs about 1.15 GB while it reads them; without, 1.6 MB, read from the
+  front orientation alone.
 - **IoSR listening room** ([IoSR_ListeningRoom_BRIRs](https://github.com/IoSR-Surrey/IoSR_ListeningRoom_BRIRs),
   CC BY 4.0): 24 loudspeakers in the 22.2 positions, head orientations at
   2.5°, one 1.5 GB `MultiSpeakerBRIR`.

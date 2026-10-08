@@ -99,12 +99,15 @@ mod saf_ffi {
 }
 
 /// Maximum number of speakers supported without heap allocation.
-/// Covers all standard immersive audio layouts (up to 22.2).
+/// Covers all standard immersive audio layouts (up to 22.2), and a measured
+/// room's loudspeakers with an LFE: a room is prepared with up to
+/// [`crate::binaural::brir::PREPARED_MAX_EMITTERS`] of them, and the binaural
+/// path builds its virtual array on every one.
 ///
 /// It bounds the whole layout, LFE and non-spatialized speakers included:
-/// [`Gains`] carries one gain per speaker of the layout. Lifting it means
-/// gain buffers sized per layout instead (mgth/Omniphony#745).
-pub const MAX_SPEAKERS: usize = 24;
+/// [`Gains`] carries one gain per speaker of the layout. Lifting it further
+/// means gain buffers sized per layout instead (mgth/Omniphony#745).
+pub const MAX_SPEAKERS: usize = 65;
 
 /// Refuse a layout [`Gains`] cannot hold, with a reason a user can act on.
 /// Every backend and the speaker stage size their gains by it, so a larger

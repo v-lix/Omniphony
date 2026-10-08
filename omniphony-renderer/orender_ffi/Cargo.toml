@@ -18,6 +18,9 @@ orender_engine.workspace = true
 # For build_fingerprint() (orender_build_id): the git-describe stamp lives in
 # runtime_control, which both hosts already link — one source of truth.
 runtime_control.workspace = true
+# The room preparation and config composition entry points work on the
+# renderer's own types (orender_engine does not re-export them).
+renderer.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -30,7 +33,6 @@ bridge_api.workspace = true
 reference_bridge.workspace = true
 # tests/decoder.rs: the C entry points driven over a bridge scripted in-process.
 abi_stable.workspace = true
-renderer.workspace = true
 
 [features]
 # SOFA (personalised HRTF) support, on by default: liborender is the desktop
