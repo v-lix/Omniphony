@@ -949,6 +949,7 @@ impl SpatialRenderer {
         } else {
             false
         };
+        self.control.set_brir_rendering(brir_in_use);
 
         // Output correction follows the live filters on the speaker path; the
         // headphone paths leave it (its filters belong to the room's speakers).

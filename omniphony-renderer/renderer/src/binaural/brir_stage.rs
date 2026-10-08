@@ -80,6 +80,22 @@ pub const BRIR_LADDER: [usize; 4] = [BRIR_BLOCK, 512, 2048, 8192];
 /// above which the mapping is logged as a mismatch, degrees.
 const MISMATCH_WARN_DEG: f32 = 10.0;
 
+/// Where a headphone session's room stands
+/// ([`crate::live_params::RendererControl::brir_state`]). The discriminants
+/// are the C ABI's `orender_brir_state` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum BrirState {
+    /// No room selected (or the output is not the headphones).
+    None = 0,
+    /// Selected, not resident yet: the HRTF stage renders meanwhile.
+    Loading = 1,
+    /// Resident.
+    Ready = 2,
+    /// Refused; the HRTF stage renders instead.
+    Failed = 3,
+}
+
 /// What the last BRIR load produced, for the control surface.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BrirStatus {
@@ -443,17 +459,13 @@ impl BrirStage {
         }
     }
 
-    #[cfg(feature = "sofa")]
+    /// A prepared room or a SOFA file ([`BrirSet::load`]); without the
+    /// `sofa` feature only a prepared room loads.
     fn load(key: &LoadKey, sample_rate: u32) -> Result<BrirSet, String> {
         if key.path.trim().is_empty() {
             return Err("no BRIR file selected".to_string());
         }
-        BrirSet::from_sofa(&key.path, sample_rate, &key.opts).map_err(|e| e.to_string())
-    }
-
-    #[cfg(not(feature = "sofa"))]
-    fn load(_key: &LoadKey, _sample_rate: u32) -> Result<BrirSet, String> {
-        Err("SOFA support not built into this renderer (enable the 'sofa' feature)".to_string())
+        BrirSet::load(&key.path, sample_rate, &key.opts).map_err(|e| e.to_string())
     }
 
     /// Engine rate the stage was built for.

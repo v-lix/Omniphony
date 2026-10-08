@@ -568,7 +568,8 @@ impl Engine {
     }
 
     /// Build a session from file paths: load the omniphony YAML config (if any),
-    /// resolve the speaker layout (explicit path → config layout → 7.1.4 preset),
+    /// resolve the speaker layout (the room's loudspeakers when the config
+    /// renders a room → explicit path → config layout → 7.1.4 preset),
     /// load + configure the decoder bridge, and build the renderer. This is the
     /// path both the FFI and the test harness use.
     /// `bridge_paths`: the decoder bridges asked for, in load order, or empty
@@ -656,13 +657,55 @@ impl Engine {
         let profiles_info = loaded_cfg.as_ref().map(Config::profiles_info);
         let mut render_cfg = loaded_cfg.and_then(|c| c.render);
 
-        let layout = if let Some(p) = speaker_layout_path {
+        // A room's loudspeakers come before any other layout, the host's
+        // included: a room renders on its own loudspeakers once it loads, and
+        // a session built narrower than the room could never move onto them
+        // (see `RendererControl::brir_layout`) - a host that names a layout
+        // for its own render mode cannot know a config has since chosen a
+        // room. Built on them from the start, the fallback while the room
+        // loads renders on the same virtual array.
+        let room = render_cfg.as_ref().and_then(|c| {
+            let room = c.binaural.as_ref()?.room_loudspeakers()?;
+            let center_blend = renderer::config_fields::room::resolve(c)
+                .map_or(renderer::config_fields::room::DEFAULT_CENTER_BLEND, |r| {
+                    r.center_blend
+                });
+            Some((room, center_blend))
+        });
+        // The layout the session has without a room - the host's, the
+        // config's, or 7.1.4 - stays the editable one whichever it is built
+        // on: what a SaveConfig writes as the listener's layout, and what a
+        // rebuild falls back on while no room is in use.
+        let own_layout = if let Some(p) = speaker_layout_path {
             SpeakerLayout::from_file(p)?
         } else if let Some(l) = render_cfg.as_ref().and_then(|c| c.current_layout.clone()) {
             l
         } else {
             SpeakerLayout::preset("7.1.4")?
         };
+        // With the room they were measured in: the layout's speakers are
+        // fractions of it, and a topology that placed them in the user's
+        // room would put every virtual speaker away from its loudspeaker
+        // until the room's own topology replaced it.
+        let room_layout = room.and_then(|(room, center_blend)| {
+            renderer::binaural::brir::measured_room_layout(
+                &room.emitters,
+                room.corners,
+                center_blend,
+            )
+            .inspect_err(|e| {
+                log::warn!("the room's loudspeakers make no layout ({e:#}); the session is built on its own")
+            })
+            .ok()
+            .map(|layout| {
+                let measured =
+                    renderer::binaural::brir::MeasuredRoom::of(&room.emitters, room.corners);
+                (layout, measured.ratios(center_blend))
+            })
+        });
+        let layout = room_layout
+            .as_ref()
+            .map_or_else(|| own_layout.clone(), |(layout, _)| layout.clone());
 
         // Resolve the bridges with the shared strict policy (identical for
         // the CLI and this FFI/mpv host): explicitly requested paths (FFI
@@ -735,6 +778,16 @@ impl Engine {
         // Seed monitoring cadences from config (renderer is the source of
         // truth); embedded default is 10 Hz.
         let control = renderer.renderer_control();
+        if let Some((layout, room)) = room_layout {
+            // The renderer places a layout in the user's room: the room's
+            // loudspeakers go in their own before anything renders. No table
+            // is sampled here; the speaker stage samples its bands on the
+            // first frame either way.
+            if let Some(plan) = control.prepare_topology_rebuild_for_layout(layout, room) {
+                control.publish_topology(plan.build_topology()?);
+            }
+            control.with_editable_layout(|editable| *editable = own_layout);
+        }
         // Propagate config_path + bridge_path so that the OSC SaveConfig
         // command can persist the live state (CLI bootstrap does this in
         // cli/decode/bootstrap.rs; any embedder of this engine — FFI,
@@ -1011,6 +1064,45 @@ impl Engine {
     /// configured one once that build lands (after the first rendered block).
     pub fn hrir_status(&self) -> std::sync::Arc<renderer::binaural::HrirStatus> {
         self.renderer.renderer_control().binaural_hrir_status()
+    }
+
+    /// Whether the last rendered frame was convolved with a room (a `brir`
+    /// source whose set is resident). While a room loads, or when it could
+    /// not be loaded, the HRTF stage renders its virtual array instead, and
+    /// [`Self::hrir_status`] names that set.
+    pub fn brir_rendering(&self) -> bool {
+        self.renderer.renderer_control().brir_rendering()
+    }
+
+    /// How the last frames reached the headphones, as a host shows it:
+    /// `room:N` while a room of `N` loudspeakers convolves, `cascade:N`
+    /// while objects are panned onto `N` virtual loudspeakers for the HRTF
+    /// stage (a room's own while it loads), `direct` when each object is
+    /// convolved as a direction of its own, `speakers:N` off the headphones.
+    /// Read from the session, not the config, so it follows whatever chose
+    /// the render.
+    pub fn render_path(&self) -> String {
+        use renderer::live_params::OutputMode;
+        let control = self.renderer.renderer_control();
+        if self.brir_rendering()
+            && let Some(room) = &control.binaural_brir_status().loaded
+        {
+            return format!("room:{}", room.emitters);
+        }
+        let speakers = control.active_topology().num_spatializable;
+        let live = control.live.read();
+        if live.binaural.output_mode != OutputMode::Binaural {
+            format!("speakers:{speakers}")
+        } else if live.binaural.cascade_active() {
+            format!("cascade:{speakers}")
+        } else {
+            "direct".to_string()
+        }
+    }
+
+    /// Where a selected room stands: none, loading, resident or refused.
+    pub fn brir_state(&self) -> renderer::binaural::BrirState {
+        self.renderer.renderer_control().brir_state()
     }
 
     /// Reset the session after a seek or stream discontinuity. Flushes the
