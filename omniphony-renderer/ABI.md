@@ -121,7 +121,94 @@ with, using the `hrir_source` selectors (`saf`, `sofa`, `brir`, ...), with the
 the one configured: a SOFA file that failed to load reads as `saf`. A
 configured set is requested with the first rendered block and built off the
 audio thread, so the answer is live and can change shortly after a stream
-starts.
+starts. It reads `brir` only once a frame was convolved with a room; while a
+room loads, or after it was refused, the HRTF stage renders its virtual
+array on the embedded set and it reads `saf`.
+
+### Measured rooms
+
+`orender_brir_prepare(sofa, len, kept_path, out_path, summary, cap)`
+prepares a room once, so that a session does not open a room-response SOFA
+file (hundreds of megabytes) every time it starts. It first describes the
+bytes as `orender_sofa_describe` does, in the same pass over them, so a host
+that chooses a room asks this alone: what the room stage does not take (an
+HRTF set, a prepared room, or neither) returns 2 with that description, and
+nothing is prepared. When `kept_path` (NULL allowed) is the room a host
+keeps for the file, of this engine's format and prepared from these same
+bytes, it returns 1 and writes nothing: the kept room stays. It reads the
+file's geometry, then only
+the measurements of the head orientation nearest straight ahead (what a
+session without head tracking renders): the BBC 7.1.4 set (274 MB) prepares
+in 0.4 s on x86, its memory little more than the bytes passed in. It keeps
+responses up to 10 s past their common lead, checks the result loads and
+makes a speaker layout, and writes a prepared room to `out_path`
+through `out_path.part`; name it `<room>.room` (`bbcrdlr_systemG.room`): it
+is not a SOFA file, and the loader tells the two apart by content. A session
+given that file as `brir_sofa_path` renders it exactly as it renders the SOFA
+file without head tracking, and is built on the room's loudspeakers from the
+start, whatever their number (up to 64), rather than on the 7.1.4 layout a
+13-loudspeaker room does not fit. So is a session given the SOFA file itself
+(from its geometry, the file read once more), and either way the room's
+loudspeakers come before a `speaker_layout_path` the host passes. The
+summary line is the file's description (its loudspeakers, rate and
+identity among it), with the prepared room's `seconds=` (its longest
+response) and `bytes=` before its `reason=` when it was prepared. Returns 0
+(prepared), 1 (kept), 2 (not a room to prepare), -1 (not a usable room, or
+no SOFA support), -2 (cannot write), -3 (NULL argument or internal error).
+
+A prepared room keeps the room its loudspeakers were measured in, when the
+file states it (its `RoomType` and corners), so that it pans in the same
+measured room as its file, and the identity of the SOFA file it was made
+from: the file's length and the 64-bit FNV-1a hash of its bytes, which
+`orender_sofa_describe` reports for the room and for a SOFA file alike as
+`source=<length>-<16 hex digits>`. A host matches a file against the room
+it keeps for it by that, and prepares it again only when they differ. A
+prepared room is of one format, which this engine writes and reads and no
+other: a room of another format, an older engine's, is refused where it is
+loaded or described ("prepare it again from its SOFA file"), so that a room
+is never played as something it is not; nothing reads a room any other way.
+Its layout is the engine's own (`ExtractedRoom::to_prepared`); a host reads
+what it needs through `orender_sofa_describe`.
+
+`orender_brir_state(r)`: 0 no room selected, 1 loading, 2 resident, 3
+refused (the reason is in the log), -1 for a NULL handle. Live, like
+`orender_hrir_in_use`.
+
+`orender_render_path(r, out, cap)` says how the last frames reached the
+headphones: `room:N` while a room of `N` loudspeakers convolves,
+`cascade:N` while objects are panned onto `N` virtual loudspeakers for the
+HRTF stage (a room's own while it loads), `direct` when each object is
+convolved as a direction of its own, `speakers:N` for speaker output. It
+follows the session rather than the host's settings, so a config that chose
+a room or a mode reads as rendered. Live, with the fill convention of
+`orender_source_label`.
+
+`orender_sofa_describe(sofa, len, out, cap)` says what a SOFA file or a
+prepared room holds, and which binaural stage takes it, before a host
+copies or prepares anything; of a SOFA file only the shape and geometry are
+read, so a room set of hundreds of MB is described in a moment (a prepared
+room, a few MB, is read whole). The HRTF stage takes
+one direction per measurement and convolves the first few milliseconds of
+each; the room stage takes up to 64 loudspeakers measured with their room.
+A multi-speaker room (`MultiSpeakerBRIR`) suits only the room stage: cut to
+the HRTF stage's few milliseconds, the room in it is gone. Nor does the HRTF
+stage take a set any measurement of which has its `SourcePosition` at the
+listener, fewer than three distinct directions, more than 2²⁴ values of
+`Data.IR`, or a file over 144 MB: those are refused before a response is
+read, by the stage itself too (see `hrtf_sofa_path` in BINAURAL.md).
+Returns a mask, 1 HRTF and 2 room (0 neither), -1 for bytes that are
+neither a SOFA file nor a prepared room of this engine's format, -3 on a
+NULL argument or an internal error. The line is `hrtf=yes|no room=yes|no
+prepared=yes|no conventions=… measurements=… receivers=… emitters=…
+samples=… rate=… source=…`, then `orientations=… speakers=… names=…` for a
+room, and `reason=…` to its end for the stage that does not take the file -
+for a file neither takes, `as an HRTF set, …; as a room, …`. `source` is
+the file's identity, or for a prepared room the identity of the file it was
+made from (see *Measured rooms*).
+
+A seek (`orender_reset`) now leaves nothing of the previous stream's room:
+the BRIR stage's histories, the reflections and the late reverb are cleared
+in place with the rest of the per-stream state.
 
 The Rust plugin interface is `bridge_api` 0.7, one minor past upstream's 0.6
 for the method described below; its package version is independent of the C

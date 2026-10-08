@@ -95,8 +95,8 @@ smaller.
 | `unit_scale_m` | `1.0` | metres per ADM unit — isotropic distance scale (the anisotropic `room_ratio` is deliberately not used here) |
 | `head_radius_m` | `0.0875` | effective head radius (half the inter-ear distance) for the Woodworth ITD model; fit it to the listener (clamped 0.05–0.15) |
 | `hrir_source` | `saf` | `saf`/`kemar` (embedded measured KEMAR), `synthetic` (analytic head shadow), `sofa` (personalised set, needs the `sofa` build feature), `brir` (a measured room, see *Room responses* below; same build feature) |
-| `hrtf_sofa_path` | — | SOFA file used when `hrir_source: sofa`; kept while another source is selected, and reopened by a bare `sofa` |
-| `brir_sofa_path` | — | SOFA room-response file used when `hrir_source: brir`; kept while another source is selected, and reopened by a bare `brir` |
+| `hrtf_sofa_path` | — | SOFA file used when `hrir_source: sofa`; kept while another source is selected, and reopened by a bare `sofa`. A file is refused before its responses are read when a measurement's `SourcePosition` is at the listener (no direction), when it measures fewer than three directions, when `Data.IR` holds more than 2²⁴ values, or when the file is larger than 144 MB: the densest free-field sets hold some seven million, and responses longer than that are a room's |
+| `brir_sofa_path` | — | SOFA room-response file, or a room prepared from one (see *Prepared rooms*), used when `hrir_source: brir`; kept while another source is selected, and reopened by a bare `brir` |
 | `brir_head_tracking` | — | keep every measured head orientation of the BRIR resident. Unset: follows `head_tracking.osc_address` (orientations are loaded when it is set, a single one otherwise) |
 | `brir_max_length_s` | `2.0` | longest response kept, seconds (`0` = whole responses) |
 | `brir_tail_floor_db` | `60` | decibels below a response's total energy at which its tail is cut |
@@ -271,7 +271,14 @@ How it renders:
   measurement did.
 - **Nothing else is added**: no ITD model, air absorption, reflections or
   reverb — they are in the measurement. The LFE keeps its direct feed to
-  both ears.
+  both ears, unless the room measured its LFE loudspeakers: a room whose 24
+  loudspeakers are ITU-R BS.2051 Sound System H (22.2), each within its
+  channel's range of Table 10, plays the LFE through its LFE1 and LFE2
+  loudspeakers, each at half so that the two sum to one loudspeaker's level,
+  and pans nothing to them (the layout has 22 loudspeakers and the LFE). The
+  LFE ranges overlap the bottom front corners', so a loudspeaker counts as
+  an LFE only when every way of seating the room in System H's channels
+  makes it one.
 - **Head tracking** selects, per loudspeaker, the response measured at the
   head orientation nearest to the tracked one (yaw and pitch; the sets
   measure yaw), blended over a few milliseconds. The first 19 ms of the
@@ -291,11 +298,21 @@ How it renders:
   latency, their work spread over the short blocks in between, so a long
   room costs little more than a short one (a 2 s response about 1.7 times a
   quarter-second one).
-- **Conventions**: `MultiSpeakerBRIR` (loudspeakers × head orientations, the
-  BBC and Huddersfield databases), and the one-loudspeaker conventions
+- **Conventions**: `MultiSpeakerBRIR` (loudspeakers × head orientations, as
+  the BBC database measures them), and the one-loudspeaker conventions
   (`SingleRoomSRIR`, `SingleRoomDRIR`, or a `SimpleFreeFieldHRIR` carrying
   room-length responses as the ASH Toolset exports) where each measured
-  source position becomes a loudspeaker. Every loudspeaker must have been
+  source position becomes a loudspeaker; and a `GeneralFIR` set that moves
+  its one loudspeaker per measurement in `EmitterPosition` and has no
+  `ListenerView`, its head's turn kept in its ears (`ReceiverPosition`), as
+  the IoSR set does: the head faces across its ears, and the set is turned
+  so that its first measurement looks straight ahead. A set whose head
+  orientations cover only an arc of 90° or more - measured turning from one
+  side to the other of where the listener faces, as TU Berlin's Calypso 5.0
+  set does from 0° to 180° about its centre loudspeaker at 90° - is turned
+  to face the arc's middle; one covering the circle keeps `+x` (the BBC's, the
+  Salford set's). A room needs at least three loudspeakers to place a sound
+  between. Every loudspeaker must have been
   measured at every kept orientation. Responses are resampled to the engine
   rate and normalised to unit mean direct-sound energy — the HRIR scale — so
   switching between an HRTF and a BRIR keeps the level.
@@ -313,6 +330,31 @@ How it renders:
   the room is chosen. The state snapshot's `binaural.modeEffective` says
   which path renders.
 
+### Prepared rooms
+
+A measured set is large, and when nothing tracks the head only one
+orientation of it is rendered. The loader reads the file's geometry first,
+then only the measurements the kept orientations come from: the BBC 7.1.4
+set below loads its front orientation in about 0.6 s on x86, its memory the
+file's own size, where every orientation takes 3.6 s and 1.15 GB. A host
+can still do that once, when the room is chosen, with
+`orender_brir_prepare` (see ABI.md) or `renderer::binaural::brir::prepare_room`:
+the result keeps the orientation nearest straight ahead and the responses as
+measured (up to 10 s past their common lead), a few megabytes, and
+`brir_sofa_path` takes it in place of the SOFA file. Name it after its file
+with a `.room` extension (`bbcrdlr_systemG.room`): it is not a SOFA file,
+and the loader tells the two apart by content. It also carries the identity
+of the file it was made from (its length and FNV-1a hash), so a host can tell
+from the room alone whether it is the one a file would prepare, and the room
+the loudspeakers were measured in where the file states it. It is of the one
+format this engine reads; a room of another is refused, to be prepared again
+from its file. It renders exactly as the
+file does without head tracking, loads in milliseconds, and the session is
+built on the room's loudspeakers from the start, so a room with more
+loudspeakers than the 7.1.4 layout still renders on its own. A session
+given the SOFA file itself is built on them too, from the file's geometry,
+and a room's loudspeakers come before any layout a host names.
+
 ### Where to get one
 
 - **BBC R&D listening room** ([bbcrd-brirs](https://github.com/bbc/bbcrd-brirs),
@@ -324,18 +366,42 @@ How it renders:
   every 7.1.4 position and more, 274 MB) is the one for a 7.1.4 or 9.1.4
   layout; `systemD` (4+5+0, 190 MB) for 5.1.4, `systemB` (0+5+0) for 5.1,
   `all_speakers` (674 MB) for anything else. Loaded with head tracking it
-  holds about 280 MB of responses (0.33 s each after the tail cut), 1.6 MB
-  without; the reader needs about 1.1 GB while parsing the file.
+  holds about 280 MB of responses (0.33 s each after the tail cut) and
+  needs about 1.15 GB while it reads them; without, 1.6 MB, read from the
+  front orientation alone.
 - **IoSR listening room** ([IoSR_ListeningRoom_BRIRs](https://github.com/IoSR-Surrey/IoSR_ListeningRoom_BRIRs),
-  CC BY 4.0): 24 loudspeakers in the 22.2 positions, head orientations at
-  2.5°, one 1.5 GB `MultiSpeakerBRIR`.
+  CC BY 4.0): 22 loudspeakers and 2 subwoofers in the 22.2 positions, 144
+  head orientations at 2.5°, one 1.5 GB `GeneralFIR` of 1.37 s responses
+  (the shape above). Prepared, its front orientation is 12.6 MB, and its
+  two subwoofers carry the LFE.
 - **ASH Toolset** ([ASH-Toolset](https://github.com/ShanonPearce/ASH-Toolset),
   AGPL-3.0): exports a set for the directions you choose from its measured
   rooms, as `SimpleFreeFieldHRIR`/`GeneralFIR` carrying room-length
   responses — the per-direction shape above.
-- The University of Salford's SBSBRIR (12 loudspeakers at ear height) and
-  the Huddersfield 360° concert-hall set (one source on stage) are not
-  layouts: the first has no height layer, the second one loudspeaker.
+- More sets, each described, prepared and played through the engine
+  (`bbcrdlr_systemH` is the BBC's 22-loudspeaker 22.2 without subwoofers:
+  the BBC measured 32 full-range loudspeakers and no LFE, so its LFE takes
+  the direct feed):
+  - **University of Salford SBSBRIR**
+    ([sofacoustics](https://sofacoustics.org/data/database/sbsbrir/)): 12
+    loudspeakers at ear height, 360 head orientations, 0.95 GB per listener
+    position; plays on its 12, heights folded to ear level.
+  - **TU Berlin Calypso 5.0** ([zenodo 160761](https://zenodo.org/records/160761)):
+    KEMAR at nine listener positions, head turned over 180°, 259 MB each;
+    plays as 5.0 facing its centre loudspeaker.
+  - **TuBuRo, University of Rostock**
+    ([sofacoustics](https://sofacoustics.org/data/database/tuburo/)): 64
+    loudspeakers in a square at ear height, ±80° of head orientations,
+    1.6 GB per `BRIR_` file; plays on its 64. Its `RIR_` files have one
+    microphone and are refused.
+  - **Surrey RealRoomBRIRs** ([GitHub](https://github.com/IoSR-Surrey/RealRoomBRIRs)):
+    37 directions over the front half at ear height in four rooms and
+    anechoic, room-length `SimpleFreeFieldHRIR` - the per-direction shape,
+    taken as a room or an HRTF.
+  - Refused, each with its reason: the WDR studios' `BRIR_` files
+    ([zenodo 3930833](https://zenodo.org/records/3930833)) measure one
+    monitor each, and their `DRIR_` files a microphone array; the
+    Huddersfield 360° concert-hall set measures one source on stage.
 
 ## Usage tips
 

@@ -39,12 +39,13 @@ pub mod measured;
 pub mod prtf;
 pub mod reflections;
 pub mod reverb;
+pub mod source_id;
 pub mod tracking;
 
 #[cfg(test)]
 mod validation;
 
-pub use brir_stage::{BrirStage, BrirStatus, BrirSummary};
+pub use brir_stage::{BrirStage, BrirState, BrirStatus, BrirSummary};
 pub use head_pose::HeadPose;
 pub use tracking::{CalibrationStep, HeadTracking, HeadTrackingFormat};
 

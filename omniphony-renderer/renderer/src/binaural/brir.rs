@@ -69,6 +69,7 @@ use rayon::prelude::*;
 
 use super::hrir::HRIR_SPAN_S;
 use super::measured::ResampleKernel;
+use super::source_id::SourceId;
 
 /// Onset threshold relative to the response's peak (−40 dB).
 const ONSET_FRAC: f32 = 0.01;
@@ -567,7 +568,9 @@ const MAX_DATA_DELAY_S: f32 = 1.0;
 /// A room's measured pairs at the kept head orientations, before anything is
 /// done to them: at the file's rate, `Data.Delay` applied, full length. What
 /// [`BrirSet::from_raw`] extracts from a file before [`BrirSet::finish`]
-/// trims, resamples and normalises it.
+/// trims, resamples and normalises it, and what a prepared room holds (see
+/// [`ExtractedRoom::to_prepared`]): a file reduced to the orientation a host
+/// renders loads exactly as the whole file would.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtractedRoom {
     conventions: String,
@@ -638,6 +641,9 @@ struct RoomPlan {
     emitters: Vec<[f32; 3]>,
     /// The kept orientations, sorted.
     orientations: Vec<(f32, f32)>,
+    /// Head orientations the file measured, kept or not.
+    #[cfg_attr(not(feature = "sofa"), allow(dead_code))]
+    measured_orientations: usize,
     /// Per pair (`emitter * orientations.len() + orientation`): the slot
     /// `measurement * E + emitter slot` it is read from.
     slots: Vec<usize>,
@@ -847,6 +853,7 @@ impl RoomPlan {
         Ok(Self {
             file_rate,
             emitters,
+            measured_orientations: orientations.len(),
             orientations: kept.iter().map(|&k| orientations[k]).collect(),
             slots: slot
                 .into_iter()
@@ -1240,6 +1247,186 @@ impl BrirSet {
     }
 }
 
+/// First bytes of a prepared room ([`ExtractedRoom::to_prepared`]).
+pub const PREPARED_ROOM_MAGIC: [u8; 8] = *b"OMNIROOM";
+/// The prepared-room format this engine writes and reads, and no other. Any
+/// change to what a prepared room holds, or to how a room is extracted from
+/// its SOFA file, is a new format: a room of another is refused, and the
+/// host prepares it again from its file. `prepared_rooms_are_what_this_format_makes`
+/// fails on such a change until this is raised.
+pub const PREPARED_ROOM_FORMAT: u32 = 1;
+/// The fixed part of a prepared room, ahead of its loudspeakers: the magic;
+/// the format, rate, emitter count and orientation count (`u32` each); the
+/// source file's identity; and the room's corners, a `u32` flag then six
+/// `f32` (zero when the file states none).
+const PREPARED_HEADER_LEN: usize = 8 + 4 * 4 + SourceId::BYTES + 4 + 6 * 4;
+/// Most loudspeakers a prepared room holds. A measured listening room has
+/// tens (TuBuRo's set has 64, the BBC's 32, the IoSR's 24); a free-field
+/// HRTF set read as a room has hundreds of directions, and is refused with
+/// that hint.
+pub const PREPARED_MAX_EMITTERS: usize = 64;
+/// Most head orientations a prepared room holds.
+const PREPARED_MAX_ORIENTATIONS: usize = 4096;
+/// Longest `SOFAConventions` or `RoomType` text kept, bytes.
+const PREPARED_MAX_TEXT: usize = 256;
+/// Response kept after the set's common lead, seconds: the longest
+/// `brir_max_length_s` takes, so any value of it but 0 (whole responses)
+/// renders a prepared room exactly as it renders the file.
+pub const PREPARED_MAX_LENGTH_S: f32 = 10.0;
+/// Sampling rates a prepared room may declare, Hz.
+const PREPARED_RATES: std::ops::RangeInclusive<u32> = 1_000..=768_000;
+
+/// The fixed part of a prepared room (see [`PREPARED_HEADER_LEN`]).
+struct PreparedHeader {
+    rate: u32,
+    emitters: usize,
+    orientations: usize,
+    source: SourceId,
+    corners: Option<[[f32; 3]; 2]>,
+}
+
+/// Cursor over a prepared room's bytes; every read is bounds-checked.
+struct PreparedReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> PreparedReader<'a> {
+    fn take(&mut self, n: usize) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .filter(|&end| end <= self.bytes.len())
+            .ok_or_else(|| anyhow::anyhow!("truncated at byte {}", self.at))?;
+        let out = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(out)
+    }
+
+    fn u32(&mut self) -> anyhow::Result<u32> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn f32(&mut self) -> anyhow::Result<f32> {
+        let v = f32::from_bits(self.u32()?);
+        if !v.is_finite() {
+            anyhow::bail!("non-finite value before byte {}", self.at);
+        }
+        Ok(v)
+    }
+
+    /// `n` finite floats, the length checked against what is left first.
+    fn f32s(&mut self, n: usize) -> anyhow::Result<Vec<f32>> {
+        let bytes = self.take(
+            n.checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("length overflows"))?,
+        )?;
+        let out: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        if out.iter().any(|v| !v.is_finite()) {
+            anyhow::bail!("non-finite sample before byte {}", self.at);
+        }
+        Ok(out)
+    }
+
+    /// A `u32` length then that much UTF-8, at most [`PREPARED_MAX_TEXT`].
+    fn text(&mut self, what: &str) -> anyhow::Result<String> {
+        let n = self.u32()? as usize;
+        if n > PREPARED_MAX_TEXT {
+            anyhow::bail!("{what} of {n} bytes");
+        }
+        Ok(std::str::from_utf8(self.take(n)?)
+            .map_err(|_| anyhow::anyhow!("{what} is not UTF-8"))?
+            .to_string())
+    }
+
+    /// The fixed part, every word checked.
+    fn header(&mut self) -> anyhow::Result<PreparedHeader> {
+        if self.take(8)? != PREPARED_ROOM_MAGIC {
+            anyhow::bail!("not a prepared room");
+        }
+        let format = self.u32()?;
+        if format != PREPARED_ROOM_FORMAT {
+            anyhow::bail!(
+                "a prepared room of format {format}, which this engine does not read (it reads \
+                 {PREPARED_ROOM_FORMAT}): prepare it again from its SOFA file"
+            );
+        }
+        let rate = self.u32()?;
+        if !PREPARED_RATES.contains(&rate) {
+            anyhow::bail!("implausible sampling rate {rate}");
+        }
+        let emitters = self.u32()? as usize;
+        if !(1..=PREPARED_MAX_EMITTERS).contains(&emitters) {
+            anyhow::bail!("{emitters} loudspeakers (1 to {PREPARED_MAX_EMITTERS} supported)");
+        }
+        let orientations = self.u32()? as usize;
+        if !(1..=PREPARED_MAX_ORIENTATIONS).contains(&orientations) {
+            anyhow::bail!(
+                "{orientations} head orientations (1 to {PREPARED_MAX_ORIENTATIONS} supported)"
+            );
+        }
+        let source = SourceId::from_bytes(
+            self.take(SourceId::BYTES)?
+                .try_into()
+                .expect("SourceId::BYTES"),
+        );
+        let stated = self.u32()?;
+        let c = self.f32s(6)?;
+        let corners = match stated {
+            0 => None,
+            1 => Some([[c[0], c[1], c[2]], [c[3], c[4], c[5]]]),
+            other => anyhow::bail!("room corners flag {other}"),
+        };
+        Ok(PreparedHeader {
+            rate,
+            emitters,
+            orientations,
+            source,
+            corners,
+        })
+    }
+
+    /// `n` emitter positions, each a direction (not on the listener).
+    fn emitters(&mut self, n: usize) -> anyhow::Result<Vec<[f32; 3]>> {
+        (0..n)
+            .map(|_| {
+                let p = [self.f32()?, self.f32()?, self.f32()?];
+                if (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() < SAME_POINT_M {
+                    anyhow::bail!("an emitter sits on the listener");
+                }
+                Ok(p)
+            })
+            .collect()
+    }
+}
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    for v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// `text` cut to at most [`PREPARED_MAX_TEXT`] bytes, on a character
+/// boundary, after its `u32` length.
+fn put_text(out: &mut Vec<u8>, text: &str) {
+    let mut cut = text.len().min(PREPARED_MAX_TEXT);
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    put_u32(out, cut as u32);
+    out.extend_from_slice(&text.as_bytes()[..cut]);
+}
+
 impl ExtractedRoom {
     /// The file's `SOFAConventions`.
     pub fn conventions(&self) -> &str {
@@ -1269,7 +1456,9 @@ impl ExtractedRoom {
     }
 
     /// Keep only the orientations `selection` picks of those held. Picking
-    /// again from what a selection kept picks the same.
+    /// again from what a selection kept picks the same, so a prepared room
+    /// loads under any selection as the file did under the one it was
+    /// prepared with.
     pub fn select(self, selection: OrientationSelection) -> anyhow::Result<Self> {
         let kept = select_orientations(&self.orientations, selection);
         if kept.is_empty() {
@@ -1289,6 +1478,205 @@ impl ExtractedRoom {
             ..self
         })
     }
+
+    /// Bound every response to [`PREPARED_MAX_LENGTH_S`] after the set's
+    /// common lead.
+    #[cfg_attr(not(feature = "sofa"), allow(dead_code))]
+    fn cap_length(&mut self) {
+        let cap = common_lead(&self.pairs)
+            + (PREPARED_MAX_LENGTH_S * self.file_rate as f32).round() as usize;
+        for p in &mut self.pairs {
+            p.left.truncate(cap);
+            p.right.truncate(cap);
+        }
+    }
+
+    /// The prepared room of this room, made from the SOFA file `source`
+    /// identifies: a little-endian image [`Self::from_prepared`] reads back
+    /// exactly. The fixed part ([`PREPARED_HEADER_LEN`]); the `E`
+    /// loudspeaker positions, three `f32` each, so that the fixed part and
+    /// they are all a host reads to build its array on them
+    /// ([`prepared_room_loudspeakers`]); the `O` orientations, two `f32`
+    /// each; the conventions and the room type, a `u32` length then UTF-8
+    /// each; then the `E·O` pairs, emitter-major, each its two `u32` lengths
+    /// then the left and right samples.
+    pub fn to_prepared(&self, source: SourceId) -> Vec<u8> {
+        let samples: usize = self
+            .pairs
+            .iter()
+            .map(|p| p.left.len() + p.right.len())
+            .sum();
+        let mut out = Vec::with_capacity(
+            PREPARED_HEADER_LEN
+                + 12 * self.emitters.len()
+                + 8 * self.orientations.len()
+                + 8
+                + self.conventions.len()
+                + self.room_type.as_ref().map_or(0, String::len)
+                + 8 * self.pairs.len()
+                + 4 * samples,
+        );
+        out.extend_from_slice(&PREPARED_ROOM_MAGIC);
+        put_u32(&mut out, PREPARED_ROOM_FORMAT);
+        put_u32(&mut out, self.file_rate);
+        put_u32(&mut out, self.emitters.len() as u32);
+        put_u32(&mut out, self.orientations.len() as u32);
+        out.extend_from_slice(&source.to_bytes());
+        put_u32(&mut out, u32::from(self.room_corners.is_some()));
+        let [a, b] = self.room_corners.unwrap_or_default();
+        put_f32s(&mut out, &a);
+        put_f32s(&mut out, &b);
+        for p in &self.emitters {
+            put_f32s(&mut out, p);
+        }
+        for &(yaw, pitch) in &self.orientations {
+            put_f32s(&mut out, &[yaw, pitch]);
+        }
+        put_text(&mut out, &self.conventions);
+        put_text(&mut out, self.room_type.as_deref().unwrap_or(""));
+        for p in &self.pairs {
+            put_u32(&mut out, p.left.len() as u32);
+            put_u32(&mut out, p.right.len() as u32);
+            put_f32s(&mut out, &p.left);
+            put_f32s(&mut out, &p.right);
+        }
+        out
+    }
+
+    /// Read a prepared room back, and the identity of the file it was made
+    /// from. Every count, length and value is checked before it is used;
+    /// whatever the bytes hold is read or refused with a reason, never
+    /// trusted.
+    pub fn from_prepared(bytes: &[u8]) -> anyhow::Result<(Self, SourceId)> {
+        let mut r = PreparedReader { bytes, at: 0 };
+        let h = r.header()?;
+        let emitters = r.emitters(h.emitters)?;
+        let orientations: Vec<(f32, f32)> = (0..h.orientations)
+            .map(|_| Ok((r.f32()?, r.f32()?)))
+            .collect::<anyhow::Result<_>>()?;
+        if orientations
+            .windows(2)
+            .any(|w| w[0].partial_cmp(&w[1]) != Some(std::cmp::Ordering::Less))
+        {
+            anyhow::bail!("head orientations are not sorted and distinct");
+        }
+        let conventions = r.text("conventions text")?;
+        let room_type = Some(r.text("room type")?).filter(|t| !t.is_empty());
+        // The set's common lead - Data.Delay padding, at most a second, and
+        // the silence before the direct sound - ahead of the kept length: two
+        // seconds of it allowed.
+        let max_len =
+            ((PREPARED_MAX_LENGTH_S + 2.0 * MAX_DATA_DELAY_S) * h.rate as f32).ceil() as usize;
+        let count = h.emitters * h.orientations;
+        let mut pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (nl, nr) = (r.u32()? as usize, r.u32()? as usize);
+            if !(1..=max_len).contains(&nl) || !(1..=max_len).contains(&nr) {
+                anyhow::bail!("a response of {nl}/{nr} samples (1 to {max_len} supported)");
+            }
+            pairs.push(BrirPair {
+                left: r.f32s(nl)?,
+                right: r.f32s(nr)?,
+            });
+        }
+        if r.at != bytes.len() {
+            anyhow::bail!("{} bytes past the last response", bytes.len() - r.at);
+        }
+        let room = Self {
+            conventions,
+            file_rate: h.rate,
+            emitters,
+            orientations,
+            pairs,
+            room_type,
+            room_corners: h.corners,
+        };
+        Ok((room, h.source))
+    }
+}
+
+/// A room's virtual loudspeakers, relative to the listener in the
+/// renderer's frame, metres, and the corners of the room they stand in when
+/// the file states them: what a host builds its virtual array on before the
+/// room loads ([`measured_room_layout`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomLoudspeakers {
+    pub emitters: Vec<[f32; 3]>,
+    pub corners: Option<[[f32; 3]; 2]>,
+}
+
+/// The loudspeakers of the prepared room at `path`, from its fixed part and
+/// their positions alone (see [`ExtractedRoom::to_prepared`]). `Ok(None)`
+/// when the file is not a prepared room (a SOFA file, or too short to
+/// tell); an error when it is one that cannot be read, or of another
+/// format.
+pub fn prepared_room_loudspeakers(
+    path: &std::path::Path,
+) -> anyhow::Result<Option<RoomLoudspeakers>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut head = [0u8; PREPARED_HEADER_LEN];
+    let mut got = 0;
+    while got < head.len() {
+        match file.read(&mut head[got..])? {
+            0 => return Ok(None),
+            n => got += n,
+        }
+    }
+    if head[..8] != PREPARED_ROOM_MAGIC {
+        return Ok(None);
+    }
+    let h = PreparedReader {
+        bytes: &head,
+        at: 0,
+    }
+    .header()?;
+    let mut positions = vec![0u8; 12 * h.emitters];
+    file.read_exact(&mut positions)
+        .map_err(|e| anyhow::anyhow!("prepared room: {e}"))?;
+    let emitters = PreparedReader {
+        bytes: &positions,
+        at: 0,
+    }
+    .emitters(h.emitters)?;
+    Ok(Some(RoomLoudspeakers {
+        emitters,
+        corners: h.corners,
+    }))
+}
+
+/// The loudspeakers of the room at `path`, whichever form it takes: a
+/// prepared room's ([`prepared_room_loudspeakers`]), or a room-response SOFA
+/// file's from its geometry, front orientation, as the room loads (the file
+/// is read, its responses are not). What a host builds its virtual array on
+/// before the room loads. `Ok(None)` when the file is neither; an error when
+/// it is a room whose loudspeakers cannot be had.
+pub fn room_loudspeakers(path: &std::path::Path) -> anyhow::Result<Option<RoomLoudspeakers>> {
+    if let Some(room) = prepared_room_loudspeakers(path)? {
+        return Ok(Some(room));
+    }
+    sofa_room_loudspeakers(path)
+}
+
+#[cfg(feature = "sofa")]
+fn sofa_room_loudspeakers(path: &std::path::Path) -> anyhow::Result<Option<RoomLoudspeakers>> {
+    let bytes = std::fs::read(path)?;
+    let Ok(sofa) = sofar::reader::LazySofa::open(&bytes) else {
+        return Ok(None);
+    };
+    with_sofa_geometry(&sofa, |raw| {
+        let plan = RoomPlan::new(&raw, OrientationSelection::FrontOnly)?;
+        check_prepared_room_size(plan.emitters.len())?;
+        Ok(Some(RoomLoudspeakers {
+            emitters: plan.emitters,
+            corners: plan.room_corners,
+        }))
+    })
+}
+
+#[cfg(not(feature = "sofa"))]
+fn sofa_room_loudspeakers(_path: &std::path::Path) -> anyhow::Result<Option<RoomLoudspeakers>> {
+    Ok(None)
 }
 
 /// The IoSR listening room's 24 loudspeakers, a 22.2 room (Table 2 of its
@@ -1363,6 +1751,84 @@ pub fn measured_room_layout(
     )
 }
 
+impl BrirSet {
+    /// Load the room at `path`: a prepared room ([`prepare_room`]) or a
+    /// room-response SOFA file, told apart by the prepared room's magic.
+    /// Either way the set comes out as [`Self::from_raw`] makes it from the
+    /// file the room was prepared from.
+    pub fn load(path: &str, engine_rate: u32, opts: &BrirLoadOptions) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read '{path}': {e}"))?;
+        if bytes.starts_with(&PREPARED_ROOM_MAGIC) {
+            return ExtractedRoom::from_prepared(&bytes)
+                .and_then(|(room, _)| room.select(opts.orientations))
+                .and_then(|room| Self::finish(room, engine_rate, opts))
+                .map_err(|e| anyhow::anyhow!("prepared room '{path}': {e}"));
+        }
+        Self::from_sofa_bytes(path, &bytes, engine_rate, opts)
+    }
+
+    #[cfg(not(feature = "sofa"))]
+    fn from_sofa_bytes(
+        path: &str,
+        _bytes: &[u8],
+        _engine_rate: u32,
+        _opts: &BrirLoadOptions,
+    ) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "'{path}' is not a prepared room, and SOFA support is not built into this \
+             renderer (enable the 'sofa' feature)"
+        )
+    }
+}
+
+/// A room prepared for a host: the extracted room ([`ExtractedRoom`], front
+/// orientation only) and what a host shows about it.
+#[derive(Clone, Debug)]
+pub struct PreparedRoom {
+    pub room: ExtractedRoom,
+    /// The SOFA file it was made from, as [`ExtractedRoom::to_prepared`]
+    /// keeps it in the room.
+    pub source: SourceId,
+    /// The virtual loudspeakers' names, in the room's order, as the layout
+    /// built on them names them ([`crate::speaker_layout::SpeakerLayout::from_brir_emitters`]):
+    /// a standard name where an emitter stands near one, `E<n>` elsewhere.
+    pub speaker_names: Vec<String>,
+    /// Longest response kept under the default cut, seconds.
+    pub seconds: f32,
+}
+
+/// Prepare a room-response SOFA file, held in memory, for a host without
+/// head tracking: keep the head orientation nearest straight ahead, bound
+/// the responses to [`PREPARED_MAX_LENGTH_S`], and check that the result
+/// loads and builds a speaker layout. The returned room's
+/// [`ExtractedRoom::to_prepared`] bytes are a file [`BrirSet::load`] reads
+/// in a fraction of the time and memory the SOFA file takes, rendering it
+/// exactly as the file renders without head tracking.
+#[cfg(feature = "sofa")]
+pub fn prepare_room(sofa: &[u8]) -> anyhow::Result<PreparedRoom> {
+    prepare_room_of(sofa, SourceId::of(sofa))
+}
+
+/// [`prepare_room`] of bytes whose identity, `source`, is already known
+/// ([`SourceId::of`] them): a host that has described them
+/// ([`describe_sofa_of`]) does not hash them again.
+#[cfg(feature = "sofa")]
+pub fn prepare_room_of(sofa: &[u8], source: SourceId) -> anyhow::Result<PreparedRoom> {
+    let mut room = with_sofa_room(sofa, OrientationSelection::FrontOnly, |raw| {
+        ExtractedRoom::extract(raw, OrientationSelection::FrontOnly)
+    })?;
+    check_prepared_room_size(room.emitters.len())?;
+    room.cap_length();
+    let set = BrirSet::finish(room.clone(), room.file_rate, &BrirLoadOptions::default())?;
+    let speaker_names = room_speaker_names(&room.emitters, room.room_corners)?;
+    Ok(PreparedRoom {
+        seconds: set.max_taps() as f32 / room.file_rate as f32,
+        room,
+        source,
+        speaker_names,
+    })
+}
+
 /// The fewest loudspeakers a room renders on: the panner places a sound
 /// between three of them.
 #[cfg(feature = "sofa")]
@@ -1380,6 +1846,47 @@ fn check_room_size(emitters: usize) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// [`check_room_size`], and no more directions than a listening room is
+/// prepared with: what has hundreds is a free-field HRTF set, which belongs
+/// to the HRTF stage.
+#[cfg(feature = "sofa")]
+fn check_prepared_room_size(emitters: usize) -> anyhow::Result<()> {
+    check_room_size(emitters)?;
+    if emitters > PREPARED_MAX_EMITTERS {
+        anyhow::bail!(
+            "{emitters} measured directions, more than the {PREPARED_MAX_EMITTERS} loudspeakers \
+             a listening room is prepared with: a free-field HRTF set is chosen as an HRTF"
+        );
+    }
+    Ok(())
+}
+
+/// The loudspeakers' names, in the room's order, as the layout built on them
+/// names them; an LFE loudspeaker, which the layout gives no place of its
+/// own, by the channel it is: `LFE1` on the left, `LFE2` on the right.
+fn room_speaker_names(
+    emitters: &[[f32; 3]],
+    corners: Option<[[f32; 3]; 2]>,
+) -> anyhow::Result<Vec<String>> {
+    let layout = measured_room_layout(
+        emitters,
+        corners,
+        crate::config_fields::room::DEFAULT_CENTER_BLEND,
+    )?;
+    // The layout holds the panned loudspeakers in the room's order, then
+    // its LFE.
+    let mut panned = layout.speaker_names().into_iter();
+    Ok(emitters
+        .iter()
+        .zip(lfe_emitters(emitters))
+        .map(|(p, lfe)| match lfe {
+            true if p[0] <= 0.0 => "LFE1".to_string(),
+            true => "LFE2".to_string(),
+            false => panned.next().unwrap_or_default().to_string(),
+        })
+        .collect())
 }
 
 /// A channel of [`SYSTEM_H`]: its azimuth range and its elevation range in
@@ -1503,6 +2010,129 @@ pub fn lfe_emitters(emitters: &[[f32; 3]]) -> Vec<bool> {
         .filter(|&(_, &is)| is)
         .all(|(e, _)| seat_in_system_h(&fits, Some(e)).is_none());
     if certain { lfe } else { none }
+}
+
+/// What a SOFA file or a prepared room holds - of a SOFA file only its shape
+/// and geometry are read, no response - and which of this engine's two
+/// binaural stages takes it, for a host to tell its user before anything is
+/// copied or prepared.
+///
+/// The HRTF stage (`hrtf_sofa_path`) wants one direction per measurement,
+/// `Data.IR` as `[M][R][N]`, and convolves the first few milliseconds of
+/// each response, time-aligned. The room stage (`brir_sofa_path`) wants up
+/// to [`PREPARED_MAX_EMITTERS`] loudspeakers, each measured with its room at
+/// the head orientation nearest straight ahead. A multi-speaker room file
+/// suits only the room stage: its responses hold several loudspeakers per
+/// measurement, and cut to a few milliseconds the room in them is gone. A
+/// free-field set of hundreds of directions suits only the HRTF stage. A
+/// per-direction set of a few room-length responses suits both.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SofaContents {
+    /// `SOFAConventions`, as the file names it.
+    pub conventions: String,
+    /// A prepared room rather than a SOFA file.
+    pub prepared: bool,
+    /// The SOFA file's identity: these bytes', or for a prepared room the
+    /// file's it was made from. What a host matches a file against the room
+    /// or HRIR grid it keeps for it by.
+    pub source: SourceId,
+    /// The responses' rate, Hz.
+    pub rate: u32,
+    /// `Data.IR`'s measurements, receivers, emitters per measurement (1 for
+    /// a three-axis array) and samples per response.
+    pub measurements: usize,
+    pub receivers: usize,
+    pub emitters: usize,
+    pub samples: usize,
+    /// Why the HRTF stage would not take it, or `None` when it would.
+    pub hrtf_refusal: Option<String>,
+    /// The room it prepares as, or why it would not.
+    pub room: Result<RoomContents, String>,
+}
+
+/// A room as [`SofaContents`] reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomContents {
+    /// The loudspeakers, as [`PreparedRoom::speaker_names`] names them.
+    pub speakers: Vec<String>,
+    /// Head orientations measured; a prepared room keeps one.
+    pub orientations: usize,
+}
+
+/// Describe a SOFA file or a prepared room held in memory (see
+/// [`SofaContents`]). Errors when the bytes are neither.
+pub fn describe_room_file(bytes: &[u8]) -> anyhow::Result<SofaContents> {
+    if bytes.starts_with(&PREPARED_ROOM_MAGIC) {
+        let (room, source) = ExtractedRoom::from_prepared(bytes)?;
+        let samples = room.pairs.iter().map(|p| p.left.len()).max().unwrap_or(0);
+        return Ok(SofaContents {
+            conventions: room.conventions.clone(),
+            prepared: true,
+            source,
+            rate: room.file_rate,
+            measurements: room.orientations.len(),
+            receivers: 2,
+            emitters: room.emitters.len(),
+            samples,
+            hrtf_refusal: Some("a prepared room renders only as a room".to_string()),
+            room: room_speaker_names(&room.emitters, room.room_corners)
+                .map(|speakers| RoomContents {
+                    speakers,
+                    orientations: room.orientations.len(),
+                })
+                .map_err(|e| format!("{e:#}")),
+        });
+    }
+    describe_sofa_of(bytes, SourceId::of(bytes))
+}
+
+/// What a SOFA file held in memory holds, as [`describe_room_file`] says,
+/// for bytes whose identity, `source`, is already known ([`SourceId::of`]
+/// them).
+#[cfg(feature = "sofa")]
+pub fn describe_sofa_of(bytes: &[u8], source: SourceId) -> anyhow::Result<SofaContents> {
+    let sofa = sofar::reader::LazySofa::open(bytes)
+        .map_err(|e| anyhow::anyhow!("not a SOFA file this engine reads: {e}"))?;
+    let shape = sofa.ir_shape();
+    let (m, r, e, n) = match shape.as_slice() {
+        &[m, r, n] => (m, r, 1, n),
+        &[m, r, e, n] => (m, r, e, n),
+        other => anyhow::bail!("Data.IR has {} axes, expected 3 or 4", other.len()),
+    };
+    let h = sofa.hrtf();
+    let hrtf_refusal = super::measured::hrtf_refusal(&sofa, bytes.len() as u64);
+    let conventions = h
+        .attributes
+        .get("SOFAConventions")
+        .cloned()
+        .unwrap_or_default();
+    let rate = h.data_sampling_rate.values.first().copied().unwrap_or(0.0);
+    let room = with_sofa_geometry(&sofa, |raw| {
+        let plan = RoomPlan::new(&raw, OrientationSelection::FrontOnly)?;
+        check_prepared_room_size(plan.emitters.len())?;
+        Ok(RoomContents {
+            speakers: room_speaker_names(&plan.emitters, plan.room_corners)?,
+            orientations: plan.measured_orientations,
+        })
+    })
+    .map_err(|e| format!("{e:#}"));
+    Ok(SofaContents {
+        conventions,
+        prepared: false,
+        source,
+        rate: rate.round().max(0.0) as u32,
+        measurements: m,
+        receivers: r,
+        emitters: e,
+        samples: n,
+        hrtf_refusal,
+        room,
+    })
+}
+
+#[cfg(not(feature = "sofa"))]
+pub fn describe_sofa_of(_bytes: &[u8], _source: SourceId) -> anyhow::Result<SofaContents> {
+    anyhow::bail!("not a prepared room, and SOFA support is not built into this renderer")
 }
 
 /// Indices (into the sorted orientation list) to keep under `sel`.
@@ -2334,6 +2964,351 @@ mod tests {
         s.delay = vec![-5.0, 0.0];
         BrirSet::from_raw(&s.raw(), 48000, &BrirLoadOptions::default()).expect("negative");
     }
+
+    /// Every field of two sets, sample for sample.
+    fn assert_same_set(a: &BrirSet, b: &BrirSet, what: &str) {
+        assert_eq!(a.sample_rate(), b.sample_rate(), "{what}: rate");
+        assert_eq!(a.conventions(), b.conventions(), "{what}: conventions");
+        assert_eq!(a.emitters(), b.emitters(), "{what}: emitters");
+        assert_eq!(a.orientations(), b.orientations(), "{what}: orientations");
+        assert_eq!(a.max_taps(), b.max_taps(), "{what}: taps");
+        for e in 0..a.emitters().len() {
+            for o in 0..a.orientations().len() {
+                assert_eq!(a.pair(e, o), b.pair(e, o), "{what}: pair ({e}, {o})");
+            }
+        }
+    }
+
+    /// The front-only room through its prepared bytes, loaded as a host
+    /// loads it.
+    fn through_prepared(s: &Synth, engine_rate: u32, opts: &BrirLoadOptions) -> BrirSet {
+        let room = ExtractedRoom::extract(&s.raw(), OrientationSelection::FrontOnly).unwrap();
+        let source = SourceId::of(b"the file");
+        let bytes = room.to_prepared(source);
+        let back = ExtractedRoom::from_prepared(&bytes).unwrap();
+        assert_eq!(back, (room, source), "the prepared bytes read back exactly");
+        BrirSet::finish(back.0.select(opts.orientations).unwrap(), engine_rate, opts).unwrap()
+    }
+
+    /// A prepared room renders exactly as its file does without head
+    /// tracking: same geometry, same pairs, bit for bit, whatever the
+    /// selection, cut or resampling asked of the load.
+    #[test]
+    fn a_prepared_room_loads_exactly_as_its_file_does() {
+        let front = BrirLoadOptions {
+            orientations: OrientationSelection::FrontOnly,
+            ..BrirLoadOptions::default()
+        };
+        let mut cases = vec![
+            (
+                "multi-speaker, five views",
+                multi_speaker(
+                    &[30.0, -30.0, 0.0, 110.0, -110.0],
+                    &[-40.0, -20.0, 0.0, 20.0, 40.0],
+                    2400,
+                    48000.0,
+                    0.05,
+                ),
+                48000,
+            ),
+            (
+                "44.1 kHz resampled to 48 kHz",
+                multi_speaker(&[30.0, -30.0, 0.0], &[0.0, 90.0], 2205, 44100.0, 0.05),
+                48000,
+            ),
+            (
+                "48 kHz resampled to 96 kHz",
+                multi_speaker(&[45.0, -45.0], &[0.0], 2400, 48000.0, 0.05),
+                96000,
+            ),
+        ];
+        let mut delayed = multi_speaker(&[0.0, 90.0], &[0.0], 1200, 48000.0, 0.05);
+        delayed.delay = vec![3.0, 11.0];
+        cases.push(("Data.Delay per receiver", delayed, 48000));
+
+        for (what, s, rate) in &cases {
+            for opts in [
+                front,
+                BrirLoadOptions {
+                    max_length_s: 0.02,
+                    tail_floor_db: 40.0,
+                    ..front
+                },
+                // A host asking for every orientation of a prepared room gets
+                // the one it holds.
+                BrirLoadOptions::default(),
+            ] {
+                let want = BrirSet::from_raw(&s.raw(), *rate, &front_or(opts)).unwrap();
+                let got = through_prepared(s, *rate, &opts);
+                assert_same_set(&got, &want, what);
+            }
+        }
+    }
+
+    /// The options a file load would use to match a prepared room's: the
+    /// prepared room holds the front orientation only.
+    fn front_or(opts: BrirLoadOptions) -> BrirLoadOptions {
+        BrirLoadOptions {
+            orientations: OrientationSelection::FrontOnly,
+            ..opts
+        }
+    }
+
+    /// Selecting from what a selection kept keeps it: a room extracted with
+    /// every orientation and reduced afterwards is the room extracted with
+    /// the reduced selection.
+    #[test]
+    fn selecting_again_keeps_what_a_selection_kept() {
+        let s = multi_speaker(
+            &[30.0, -30.0],
+            &[-60.0, -30.0, -2.0, 30.0, 60.0],
+            600,
+            48000.0,
+            0.0,
+        );
+        let all = ExtractedRoom::extract(&s.raw(), OrientationSelection::All).unwrap();
+        for sel in [
+            OrientationSelection::FrontOnly,
+            OrientationSelection::Decimated {
+                step_deg: 30.0,
+                max_yaw_deg: 60.0,
+            },
+            OrientationSelection::All,
+        ] {
+            let want = ExtractedRoom::extract(&s.raw(), sel).unwrap();
+            let once = all.clone().select(sel).unwrap();
+            assert_eq!(once, want, "{sel:?}");
+            assert_eq!(once.clone().select(sel).unwrap(), want, "{sel:?} twice");
+        }
+    }
+
+    /// Whatever the bytes hold, a prepared room is read or refused with a
+    /// reason: every truncation, any flipped byte, trailing data, a NaN.
+    #[test]
+    fn a_damaged_prepared_room_is_refused_never_trusted() {
+        let s = multi_speaker(&[30.0, -30.0, 0.0], &[0.0], 300, 48000.0, 0.05);
+        let bytes = ExtractedRoom::extract(&s.raw(), OrientationSelection::FrontOnly)
+            .unwrap()
+            .to_prepared(SourceId::of(b"the file"));
+        for cut in (0..bytes.len()).step_by(7) {
+            assert!(
+                ExtractedRoom::from_prepared(&bytes[..cut]).is_err(),
+                "cut at {cut} of {}",
+                bytes.len()
+            );
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        let err = ExtractedRoom::from_prepared(&longer).unwrap_err();
+        assert!(err.to_string().contains("past the last response"), "{err}");
+
+        // Each header word set to all ones: a format, rate, count or corner
+        // flag nothing could hold.
+        for word in [2, 3, 4, 5, 10] {
+            let mut bad = bytes.clone();
+            bad[4 * word..4 * word + 4].copy_from_slice(&[0xff; 4]);
+            assert!(ExtractedRoom::from_prepared(&bad).is_err(), "word {word}");
+        }
+        // So is a text length: the conventions' follows the three loudspeakers
+        // and the orientation.
+        let at = PREPARED_HEADER_LEN + 3 * 12 + 8;
+        let mut bad = bytes.clone();
+        bad[at..at + 4].copy_from_slice(&[0xff; 4]);
+        let err = ExtractedRoom::from_prepared(&bad).unwrap_err();
+        assert!(err.to_string().contains("conventions text of"), "{err}");
+        // A NaN in the last sample.
+        let mut nan = bytes.clone();
+        let at = nan.len() - 4;
+        nan[at..].copy_from_slice(&f32::NAN.to_le_bytes());
+        let err = ExtractedRoom::from_prepared(&nan).unwrap_err();
+        assert!(err.to_string().contains("non-finite"), "{err}");
+        // Any single flipped byte is read or refused, without a panic.
+        for at in 0..bytes.len() {
+            let mut flipped = bytes.clone();
+            flipped[at] ^= 0x5a;
+            let _ = ExtractedRoom::from_prepared(&flipped);
+        }
+    }
+
+    /// A prepared room carries the identity of the file it was made from,
+    /// and is of the one format this engine reads: a room of any other is
+    /// refused, with the reason a host passes on.
+    #[test]
+    fn a_prepared_room_carries_its_files_identity_in_its_one_format() {
+        let s = multi_speaker(&[30.0, -30.0, 0.0], &[0.0], 300, 48000.0, 0.05);
+        let room = ExtractedRoom::extract(&s.raw(), OrientationSelection::FrontOnly).unwrap();
+        let source = SourceId::of(b"/storage/sofa/bbcrdlr_systemG.sofa");
+        let bytes = room.to_prepared(source);
+        assert_eq!(&bytes[..8], &PREPARED_ROOM_MAGIC);
+        assert_eq!(bytes[8..12], PREPARED_ROOM_FORMAT.to_le_bytes());
+        assert_eq!(
+            bytes[24..40],
+            source.to_bytes(),
+            "the identity is in the fixed part"
+        );
+        let (_, back) = ExtractedRoom::from_prepared(&bytes).unwrap();
+        assert_eq!(back, source);
+        for format in [0, PREPARED_ROOM_FORMAT + 1] {
+            let mut other = bytes.clone();
+            other[8..12].copy_from_slice(&format.to_le_bytes());
+            let err = ExtractedRoom::from_prepared(&other)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("format {format}")) && err.contains("prepare it again"),
+                "{err}"
+            );
+        }
+    }
+
+    /// What this format makes of a room is pinned: a change to what a
+    /// prepared room holds, or to how a room is extracted from its file,
+    /// fails here until [`PREPARED_ROOM_FORMAT`] is raised and the identity
+    /// below updated, so that every room an older engine prepared is
+    /// prepared again rather than played as something it is not.
+    #[cfg(feature = "sofa")]
+    #[test]
+    fn prepared_rooms_are_what_this_format_makes() {
+        // A room that states its type and corners, so that they are pinned too.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/sofa/room_corners_cartesian.sofa");
+        let sofa = std::fs::read(&path).unwrap();
+        let prepared = prepare_room(&sofa).unwrap();
+        assert_eq!(prepared.source, SourceId::of(&sofa));
+        assert!(prepared.room.room_corners().is_some() && prepared.room.room_type.is_some());
+        let bytes = prepared.room.to_prepared(prepared.source);
+        assert_eq!(
+            (PREPARED_ROOM_FORMAT, SourceId::of(&bytes).to_string()),
+            (1, "24167-c01cb9f17a6283bd".to_string()),
+            "the prepared room changed: raise PREPARED_ROOM_FORMAT and update this"
+        );
+    }
+
+    /// A room-response SOFA file's loudspeakers are the ones it prepares
+    /// with, read from its geometry; anything else is no room.
+    #[cfg(feature = "sofa")]
+    #[test]
+    fn a_sofa_rooms_loudspeakers_are_read_from_its_geometry() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sofa");
+        for name in [
+            "chunked_multispeaker_brir.sofa",
+            "rows_multispeaker_brir.sofa",
+        ] {
+            let path = dir.join(name);
+            let prepared = prepare_room(&std::fs::read(&path).unwrap()).unwrap();
+            let room = room_loudspeakers(&path).unwrap().unwrap();
+            assert_eq!(room.emitters, prepared.room.emitters(), "{name}");
+            assert_eq!(room.corners, prepared.room.room_corners(), "{name}");
+        }
+        // A free-field HRTF set is refused as a room, not taken for one.
+        assert!(room_loudspeakers(&dir.join("Pulse.sofa")).is_err());
+        assert_eq!(room_loudspeakers(&dir.join("README.md")).unwrap(), None);
+    }
+
+    /// A host sizes its virtual array from a prepared room's header alone,
+    /// and a file that is not a prepared room says so rather than failing.
+    #[test]
+    fn a_prepared_rooms_loudspeakers_are_read_from_its_header() {
+        let dir = std::env::temp_dir().join(format!("brir-header-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = multi_speaker(&[30.0, -30.0, 0.0, 110.0], &[0.0], 300, 48000.0, 0.05);
+        let room = ExtractedRoom::extract(&s.raw(), OrientationSelection::FrontOnly).unwrap();
+        let prepared = dir.join("room.prepared");
+        std::fs::write(&prepared, room.to_prepared(SourceId::of(b"room.sofa"))).unwrap();
+        assert_eq!(
+            prepared_room_loudspeakers(&prepared).unwrap(),
+            Some(RoomLoudspeakers {
+                emitters: room.emitters().to_vec(),
+                corners: None,
+            })
+        );
+        let other = dir.join("other.sofa");
+        std::fs::write(&other, b"\x89HDF\r\n\x1a\nnot a prepared room").unwrap();
+        assert_eq!(prepared_room_loudspeakers(&other).unwrap(), None);
+        std::fs::write(&other, b"OMNI").unwrap();
+        assert_eq!(
+            prepared_room_loudspeakers(&other).unwrap(),
+            None,
+            "too short to tell"
+        );
+
+        // The same file loads through the one entry point a host uses.
+        let opts = BrirLoadOptions::default();
+        let loaded = BrirSet::load(prepared.to_str().unwrap(), 48000, &opts).unwrap();
+        let want = BrirSet::from_raw(&s.raw(), 48000, &front_or(opts)).unwrap();
+        assert_same_set(&loaded, &want, "BrirSet::load");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A room prepared from a file that states the room it was measured in
+    /// keeps it: the room loads from the prepared file in the same box as
+    /// from the file, and a host reads the box from the fixed part with the
+    /// loudspeakers.
+    #[cfg(feature = "sofa")]
+    #[test]
+    fn a_prepared_room_keeps_the_room_it_was_measured_in() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/sofa");
+        let dir = std::env::temp_dir().join(format!("brir-geometry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = BrirLoadOptions {
+            orientations: OrientationSelection::FrontOnly,
+            ..BrirLoadOptions::default()
+        };
+        for name in [
+            "room_corners_cartesian.sofa",
+            "room_corners_offset_listener.sofa",
+            "room_corners_unsupported_unit.sofa",
+            "chunked_multispeaker_brir.sofa",
+        ] {
+            let path = fixtures.join(name);
+            let from_file = BrirSet::from_sofa(path.to_str().unwrap(), 48000, &opts).unwrap();
+            let prepared = dir.join(name).with_extension("room");
+            let prepared_room = prepare_room(&std::fs::read(&path).unwrap()).unwrap();
+            let room = prepared_room.room;
+            std::fs::write(&prepared, room.to_prepared(prepared_room.source)).unwrap();
+            let from_room = BrirSet::load(prepared.to_str().unwrap(), 48000, &opts).unwrap();
+            assert_eq!(from_room.room_corners(), from_file.room_corners(), "{name}");
+            assert_eq!(from_room.room_type(), from_file.room_type(), "{name}");
+            let header = prepared_room_loudspeakers(&prepared).unwrap().unwrap();
+            assert_eq!(header.corners, from_file.room_corners(), "{name}");
+            assert_eq!(header.emitters, room.emitters(), "{name}");
+            let sofa = room_loudspeakers(&path).unwrap().unwrap();
+            assert_eq!(sofa, header, "{name}: the same from the file");
+        }
+        let with_box = BrirSet::from_sofa(
+            fixtures
+                .join("room_corners_cartesian.sofa")
+                .to_str()
+                .unwrap(),
+            48000,
+            &opts,
+        )
+        .unwrap();
+        assert!(with_box.room_corners().is_some() && with_box.room_type().is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A prepared room keeps [`PREPARED_MAX_LENGTH_S`] after the set's lead.
+    #[test]
+    fn a_prepared_room_is_bounded_after_its_lead() {
+        // 1 kHz keeps the 12 s response small.
+        let mut s = multi_speaker(&[30.0], &[0.0], 12_000, 1000.0, 0.05);
+        s.delay = vec![0.0, 0.0];
+        let mut room = ExtractedRoom::extract(&s.raw(), OrientationSelection::FrontOnly).unwrap();
+        let lead = common_lead(&room.pairs);
+        room.cap_length();
+        assert_eq!(room.pairs[0].left.len(), lead + 10_000);
+        assert_eq!(room.pairs[0].right.len(), lead + 10_000);
+        // Under that bound nothing is cut.
+        let short = multi_speaker(&[30.0], &[0.0], 900, 1000.0, 0.05);
+        let mut room =
+            ExtractedRoom::extract(&short.raw(), OrientationSelection::FrontOnly).unwrap();
+        let before = room.clone();
+        room.cap_length();
+        assert_eq!(room, before);
+    }
+
     /// `raw` with `Data.IR` cut down to `run`, as a reader that read only
     /// those measurements hands it over.
     fn cut<'a>(raw: &RawRoomIr<'a>, run: std::ops::Range<usize>) -> RawRoomIr<'a> {
@@ -2730,6 +3705,11 @@ mod tests {
         let lfe = lfe_emitters(&front.emitters);
         let at: Vec<usize> = (0..24).filter(|&e| lfe[e]).collect();
         assert_eq!(at, [3, 9]);
+        let names = room_speaker_names(&front.emitters, front.room_corners).unwrap();
+        assert_eq!(
+            (names[2].as_str(), names[3].as_str(), names[9].as_str()),
+            ("C", "LFE1", "LFE2")
+        );
         assert_eq!(measured_room_buses(&front.emitters), 23);
         let layout = measured_room_layout(&front.emitters, front.room_corners, 0.5).unwrap();
         assert_eq!(layout.num_speakers(), 23);

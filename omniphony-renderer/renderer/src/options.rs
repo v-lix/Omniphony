@@ -2151,7 +2151,6 @@ const HAND_WIRED_ROWS: &[OptionSpec] = &[
         // bare "sofa" / "brir" then takes its file from its own key, and
         // falls back to the embedded KEMAR set without one.
         config_seed: |live, render, _env| {
-            use crate::binaural::HrirSource;
             let Some(bin) = binaural_cfg(render) else {
                 return;
             };
@@ -2163,17 +2162,9 @@ const HAND_WIRED_ROWS: &[OptionSpec] = &[
             if let Some(path) = file(bin.brir_sofa_path.as_ref()) {
                 live.binaural.last_brir_path = path;
             }
-            let Some(source) = bin.hrir_source.as_deref().and_then(HrirSource::from_str) else {
+            let Some(source) = bin.effective_hrir_source() else {
                 return;
             };
-            let source =
-                match source {
-                    HrirSource::Sofa(p) if p.is_empty() => file(bin.hrtf_sofa_path.as_ref())
-                        .map_or(HrirSource::SafKemar, HrirSource::Sofa),
-                    HrirSource::Brir(p) if p.is_empty() => file(bin.brir_sofa_path.as_ref())
-                        .map_or(HrirSource::SafKemar, HrirSource::Brir),
-                    other => other,
-                };
             remember_hrir_file(&mut live.binaural, &source);
             live.binaural.hrir_source = source;
         },

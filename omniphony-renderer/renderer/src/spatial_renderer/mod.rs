@@ -851,6 +851,7 @@ impl SpatialRenderer {
         } else {
             false
         };
+        self.control.set_brir_rendering(brir_in_use);
 
         // Latency of the path this frame takes: the speaker path and the
         // cascaded binaural path both mix through the main speaker stage

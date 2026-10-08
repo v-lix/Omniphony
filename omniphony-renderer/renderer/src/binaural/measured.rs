@@ -513,7 +513,8 @@ pub fn read_hrtf_file(path: &str) -> Result<Vec<u8>, String> {
 
 /// Why the HRTF stage would not take an open SOFA file of `len` bytes, read
 /// from its shape and geometry alone (no response is read), or `None` when
-/// it would.
+/// it would. Shared by the loader and by what a host is told of a file
+/// ([`super::brir::describe_room_file`]), so that the two never disagree.
 #[cfg(feature = "sofa")]
 pub fn hrtf_refusal(sofa: &sofar::reader::LazySofa<'_>, len: u64) -> Option<String> {
     hrtf_shape_refusal(&sofa.ir_shape(), &sofa.hrtf().source_position.values, len)
