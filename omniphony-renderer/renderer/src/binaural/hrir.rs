@@ -492,6 +492,85 @@ impl HrirSet {
         }
     }
 
+    /// The finished set as bytes, for [`Self::from_bytes`]: the rate, the
+    /// taps in use and the grid's shape as little-endian `u32` words, then
+    /// each pair's taps in use (left, then right) as `f32`. The rest of each
+    /// kernel is zero and is not stored.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(20 + self.grid.len() * self.len * 8);
+        for word in [
+            self.sample_rate,
+            self.len as u32,
+            self.az_count as u32,
+            self.el_count as u32,
+        ] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        for pair in &self.grid {
+            for v in pair.left[..self.len].iter().chain(&pair.right[..self.len]) {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// A set [`Self::to_bytes`] wrote, refused unless it is one this build
+    /// makes: the grid of [`Self::build`] at a rate whose kernel length it
+    /// gives, every tap finite, nothing after the last pair.
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let word = |i: usize| -> anyhow::Result<usize> {
+            let b = bytes
+                .get(i * 4..i * 4 + 4)
+                .ok_or_else(|| anyhow::anyhow!("grid header cut short"))?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        let (sample_rate, len, az_count, el_count) = (word(0)?, word(1)?, word(2)?, word(3)?);
+        let want_az = (360.0 / Self::AZ_STEP_DEG).round() as usize;
+        let want_el =
+            ((Self::EL_MAX_DEG - Self::EL_MIN_DEG) / Self::EL_STEP_DEG).round() as usize + 1;
+        if sample_rate == 0 || u32::try_from(sample_rate).is_err() {
+            anyhow::bail!("grid rate {sample_rate}");
+        }
+        let sample_rate = sample_rate as u32;
+        if len != hrir_len(sample_rate) || az_count != want_az || el_count != want_el {
+            anyhow::bail!(
+                "grid of {az_count}x{el_count} kernels of {len} taps at {sample_rate} Hz is not \
+                 one this build makes"
+            );
+        }
+        let taps = &bytes[16..];
+        if taps.len() != az_count * el_count * len * 8 {
+            anyhow::bail!("grid holds {} bytes of taps", taps.len());
+        }
+        let mut values = taps
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b));
+        let mut grid = Vec::with_capacity(az_count * el_count);
+        for _ in 0..az_count * el_count {
+            let mut pair = HrirPair::zeroed();
+            for ear in [&mut pair.left, &mut pair.right] {
+                for (o, v) in ear[..len].iter_mut().zip(values.by_ref()) {
+                    if !v.is_finite() {
+                        anyhow::bail!("grid holds a non-finite tap");
+                    }
+                    *o = v;
+                }
+            }
+            grid.push(pair);
+        }
+        Ok(Self {
+            az_count,
+            el_count,
+            el_min_deg: Self::EL_MIN_DEG,
+            el_max_deg: Self::EL_MAX_DEG,
+            len,
+            sample_rate,
+            grid,
+        })
+    }
+
     /// Taps in use per kernel — what the convolvers must run over.
     #[inline]
     pub fn len(&self) -> usize {

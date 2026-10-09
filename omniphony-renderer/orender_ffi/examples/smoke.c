@@ -36,6 +36,7 @@ int main(void) {
     if (orender_render_path(NULL, NULL, 0) != 0) { puts("FAIL: render path for NULL"); return 18; }
     if (orender_brir_prepare(NULL, 0, NULL, NULL, NULL, 0) != -3) { puts("FAIL: prepare(NULL)"); return 15; }
     if (orender_sofa_describe(NULL, 0, NULL, 0) != -3) { puts("FAIL: describe(NULL)"); return 17; }
+    if (orender_hrtf_prepare(NULL, NULL, 48000, 1, NULL, 0) != -3) { puts("FAIL: hrtf_prepare(NULL)"); return 19; }
 
     /* Build id is static and never NULL. */
     const char *build_id = orender_build_id();

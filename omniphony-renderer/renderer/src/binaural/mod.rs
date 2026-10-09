@@ -32,6 +32,7 @@ pub mod brir;
 pub mod brir_stage;
 pub mod convolver;
 pub mod diffuse_field;
+pub mod grid_cache;
 pub mod head_pose;
 pub mod hrir;
 pub mod itd;
@@ -446,6 +447,7 @@ struct HrirRequest {
     source: HrirSource,
     head_radius_m: f32,
     diffuse_field_eq: bool,
+    grid_cache: Option<grid_cache::GridCache>,
 }
 
 /// Receives each build's [`HrirStatus`]; the renderer's owner wires it to the
@@ -511,6 +513,9 @@ pub struct BinauralRenderer {
     /// Build grids on the calling thread instead of the worker — see
     /// [`Self::set_synchronous_builds`].
     synchronous_builds: bool,
+    /// Where a SOFA set's finished grid is kept between sessions, if the
+    /// host named a file - see [`Self::set_grid_cache`].
+    grid_cache: Option<grid_cache::GridCache>,
     /// Per-input-channel DSP state, indexed directly by channel. The first
     /// [`PREALLOC_CHANNELS`] slots are built at construction; a wider stream
     /// grows the vector and fills the extra slots on first use.
@@ -575,6 +580,7 @@ impl BinauralRenderer {
                             req.head_radius_m,
                             req.diffuse_field_eq,
                             sample_rate,
+                            req.grid_cache.as_ref(),
                         );
                         // Reported before the grid is handed over, so the
                         // status is never behind what is being convolved.
@@ -587,7 +593,7 @@ impl BinauralRenderer {
         // The initial (default) grid is built synchronously: `new` runs on
         // a control thread, and the renderer must be usable immediately.
         let head_radius_m = itd::DEFAULT_HEAD_RADIUS_M;
-        let initial = Self::build_grid(source.clone(), head_radius_m, false, sample_rate);
+        let initial = Self::build_grid(source.clone(), head_radius_m, false, sample_rate, None);
         sink(initial.status());
         Self {
             sample_rate,
@@ -600,6 +606,7 @@ impl BinauralRenderer {
             retire_tx,
             status_sink: sink,
             synchronous_builds: false,
+            grid_cache: None,
             // Every state a stream up to PREALLOC_CHANNELS wide can need,
             // built here on the control thread.
             channels: (0..PREALLOC_CHANNELS)
@@ -673,26 +680,30 @@ impl BinauralRenderer {
         head_radius_m: f32,
         diffuse_field_eq: bool,
         sample_rate: u32,
+        grid_cache: Option<&grid_cache::GridCache>,
     ) -> Grid {
+        let cache = grid_cache.filter(|c| c.serves(sample_rate, diffuse_field_eq));
         let (set, effective, error) = match &requested {
-            HrirSource::Sofa(path) => match Self::load_sofa(path, diffuse_field_eq, sample_rate) {
-                Ok(set) => (set, requested.clone(), None),
-                Err(reason) => {
-                    log::warn!(
-                        "binaural: SOFA source '{path}' unavailable ({reason}); falling back to SAF KEMAR"
-                    );
-                    (
-                        Self::build_hrir(
-                            &HrirSource::SafKemar,
-                            head_radius_m,
-                            diffuse_field_eq,
-                            sample_rate,
-                        ),
-                        HrirSource::SafKemar,
-                        Some(reason),
-                    )
+            HrirSource::Sofa(path) => {
+                match Self::load_sofa_cached(path, diffuse_field_eq, sample_rate, cache) {
+                    Ok(set) => (set, requested.clone(), None),
+                    Err(reason) => {
+                        log::warn!(
+                            "binaural: SOFA source '{path}' unavailable ({reason}); falling back to SAF KEMAR"
+                        );
+                        (
+                            Self::build_hrir(
+                                &HrirSource::SafKemar,
+                                head_radius_m,
+                                diffuse_field_eq,
+                                sample_rate,
+                            ),
+                            HrirSource::SafKemar,
+                            Some(reason),
+                        )
+                    }
                 }
-            },
+            }
             // A room response is rendered by the cascaded BRIR stage, which
             // reports its own load status; the direct path's grid is the
             // embedded set meanwhile, and that is not an error.
@@ -762,6 +773,61 @@ impl BinauralRenderer {
         }
     }
 
+    /// [`Self::load_sofa`] through a [`grid_cache::GridCache`] that serves the
+    /// session: the grid it keeps when that was built from this file by this
+    /// build, else the set built from the file, which it then keeps. A cache
+    /// that cannot be written costs nothing but the next build.
+    fn load_sofa_cached(
+        path: &str,
+        diffuse_field_eq: bool,
+        sample_rate: u32,
+        cache: Option<&grid_cache::GridCache>,
+    ) -> Result<HrirSet, String> {
+        // A file too large for the stage is not read: load_sofa says why.
+        let Some((cache, sofa)) =
+            cache.and_then(|c| measured::read_hrtf_file(path).ok().map(|b| (c, b)))
+        else {
+            return Self::load_sofa(path, diffuse_field_eq, sample_rate);
+        };
+        let file = cache.file(sample_rate);
+        if let Some(set) = cache.load(sample_rate, &sofa) {
+            log::info!("binaural: HRIR grid of '{path}' from {}", file.display());
+            return Ok(set);
+        }
+        let set = Self::load_sofa(path, diffuse_field_eq, sample_rate)?;
+        match cache.store(sample_rate, &sofa, &set) {
+            Ok(()) => log::info!("binaural: HRIR grid of '{path}' kept in {}", file.display()),
+            Err(e) => log::warn!(
+                "binaural: HRIR grid of '{path}' not kept in {}: {e}",
+                file.display()
+            ),
+        }
+        Ok(set)
+    }
+
+    /// Build the grid `cache` keeps for the SOFA set at `path` now, ahead of
+    /// any session: what the first session it serves would otherwise do while
+    /// the embedded set plays. A host calls it when the set is chosen, so
+    /// that the first film plays it from the start too. Nothing is built when
+    /// the file already holds the set's grid from this build.
+    pub fn prepare_grid_cache(
+        path: &str,
+        cache: &grid_cache::GridCache,
+        sample_rate: u32,
+    ) -> Result<grid_cache::Prepared, grid_cache::PrepareError> {
+        use grid_cache::{PrepareError, Prepared};
+        let sofa = measured::read_hrtf_file(path).map_err(PrepareError::Unusable)?;
+        if cache.load(sample_rate, &sofa).is_some() {
+            return Ok(Prepared::Kept);
+        }
+        let set = Self::load_sofa(path, cache.diffuse_field_eq, sample_rate)
+            .map_err(PrepareError::Unusable)?;
+        cache
+            .store(sample_rate, &sofa, &set)
+            .map_err(PrepareError::Write)?;
+        Ok(Prepared::Built)
+    }
+
     /// The set from a SOFA file, or the reason it could not be loaded — the
     /// text that reaches the control surface.
     fn load_sofa(path: &str, diffuse_field_eq: bool, sample_rate: u32) -> Result<HrirSet, String> {
@@ -787,6 +853,16 @@ impl BinauralRenderer {
         _sample_rate: u32,
     ) -> Result<HrirSet, String> {
         Err("SOFA support not built into this renderer (enable the 'sofa' feature)".to_string())
+    }
+
+    /// The file a SOFA set's finished grid is kept in between sessions, and
+    /// the sessions it serves (see [`grid_cache`]); `None` for none. Taken
+    /// by the next build, not one in flight. Called once per frame with the
+    /// live value, so it only clones when the value changes.
+    pub fn set_grid_cache(&mut self, cache: Option<&grid_cache::GridCache>) {
+        if self.grid_cache.as_ref() != cache {
+            self.grid_cache = cache.cloned();
+        }
     }
 
     /// Track the requested HRIR source and head radius. Called once per frame from the audio
@@ -821,6 +897,7 @@ impl BinauralRenderer {
                     head_radius_m,
                     diffuse_field_eq,
                     self.sample_rate,
+                    self.grid_cache.as_ref(),
                 );
                 (self.status_sink)(grid.status());
                 self.install_grid(std::sync::Arc::new(grid));
@@ -833,6 +910,7 @@ impl BinauralRenderer {
                 source: source.clone(),
                 head_radius_m,
                 diffuse_field_eq,
+                grid_cache: self.grid_cache.clone(),
             });
         } else if radius_mm != self.head_radius_mm {
             // Measured source: remember the radius so a later switch to a
@@ -1635,6 +1713,158 @@ mod tests {
     /// With synchronous builds (offline renders) the requested grid is built
     /// inside `ensure_source` and swapped in before it returns, its status
     /// reported on the way: nothing is left for a later frame to pick up.
+    /// A session the host's grid cache serves keeps the grid it built from a
+    /// SOFA file, and the next such session takes the same kernels from it
+    /// without writing it again; a session it does not serve builds as
+    /// before and leaves the file alone.
+    #[cfg(all(feature = "sofa", unix))]
+    #[test]
+    fn a_grid_cache_keeps_a_sofa_grid_for_the_sessions_it_serves() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hrir-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = HrirSource::Sofa(format!(
+            "{}/tests/sofa/tester.sofa",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let cache = grid_cache::GridCache {
+            path: dir.join("hrtf.grid"),
+            sample_rate: Some(48_000),
+            diffuse_field_eq: true,
+        };
+        let session = |rate: u32, eq: bool| {
+            let mut r = BinauralRenderer::new(rate);
+            r.set_synchronous_builds(true);
+            r.set_grid_cache(Some(&cache));
+            r.ensure_source(&source, itd::DEFAULT_HEAD_RADIUS_M, eq);
+            assert_eq!(r.hrir.effective, source);
+            r.hrir.set.to_bytes()
+        };
+        let inode = || std::fs::metadata(&cache.path).map(|m| m.ino()).ok();
+
+        session(48_000, false);
+        session(96_000, true);
+        assert_eq!(inode(), None, "not served: nothing kept");
+        let built = session(48_000, true);
+        let kept = inode().expect("kept");
+        assert_eq!(session(48_000, true), built, "the same kernels");
+        assert_eq!(inode(), Some(kept), "read, not written again");
+        session(48_000, false);
+        assert_eq!(
+            inode(),
+            Some(kept),
+            "left alone by a session it does not serve"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A cache for every rate keeps a grid per session rate, each written by
+    /// the first session at its rate and read by the next; a session without
+    /// the cache's equalisation writes none.
+    #[cfg(all(feature = "sofa", unix))]
+    #[test]
+    fn a_cache_for_every_rate_keeps_a_grid_per_session_rate() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hrir-rates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = HrirSource::Sofa(format!(
+            "{}/tests/sofa/tester.sofa",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let cache = grid_cache::GridCache {
+            path: dir.join("hrtf{khz}.grid"),
+            sample_rate: None,
+            diffuse_field_eq: true,
+        };
+        let session = |rate: u32, eq: bool| {
+            let mut r = BinauralRenderer::new(rate);
+            r.set_synchronous_builds(true);
+            r.set_grid_cache(Some(&cache));
+            r.ensure_source(&source, itd::DEFAULT_HEAD_RADIUS_M, eq);
+            assert_eq!(r.hrir.effective, source);
+        };
+        let inode = |name: &str| std::fs::metadata(dir.join(name)).map(|m| m.ino()).ok();
+        session(44_100, false);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "not served");
+        session(44_100, true);
+        session(96_000, true);
+        let (at_44, at_96) = (inode("hrtf44.grid").unwrap(), inode("hrtf96.grid").unwrap());
+        session(44_100, true);
+        session(96_000, true);
+        assert_eq!(
+            (inode("hrtf44.grid"), inode("hrtf96.grid")),
+            (Some(at_44), Some(at_96))
+        );
+        assert_eq!(inode("hrtf48.grid"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A grid prepared ahead of any session is the one a session it serves
+    /// then reads, kernel for kernel, without writing it again; preparing it
+    /// again finds it kept, and a file the HRTF stage cannot load is refused
+    /// with nothing written.
+    #[cfg(all(feature = "sofa", unix))]
+    #[test]
+    fn a_grid_prepared_ahead_is_the_one_a_session_reads() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hrir-prepare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sofa = format!("{}/tests/sofa/tester.sofa", env!("CARGO_MANIFEST_DIR"));
+        let cache = grid_cache::GridCache {
+            path: dir.join("hrtf.grid"),
+            sample_rate: Some(48_000),
+            diffuse_field_eq: true,
+        };
+        let inode = || std::fs::metadata(&cache.path).map(|m| m.ino()).ok();
+
+        let prepared = BinauralRenderer::prepare_grid_cache(&sofa, &cache, 48_000).unwrap();
+        assert_eq!(prepared, grid_cache::Prepared::Built);
+        let kept = inode().expect("kept");
+        let again = BinauralRenderer::prepare_grid_cache(&sofa, &cache, 48_000).unwrap();
+        assert_eq!(again, grid_cache::Prepared::Kept);
+        assert_eq!(inode(), Some(kept), "found, not written again");
+
+        let mut r = BinauralRenderer::new(48_000);
+        r.set_synchronous_builds(true);
+        r.set_grid_cache(Some(&cache));
+        let source = HrirSource::Sofa(sofa.clone());
+        r.ensure_source(&source, itd::DEFAULT_HEAD_RADIUS_M, true);
+        assert_eq!(r.hrir.effective, source);
+        assert_eq!(inode(), Some(kept), "read by the session, not rebuilt");
+        let built = BinauralRenderer::load_sofa(&sofa, true, 48_000).unwrap();
+        assert_eq!(r.hrir.set.to_bytes(), built.to_bytes(), "the same kernels");
+
+        let other = grid_cache::GridCache {
+            path: dir.join("other.grid"),
+            ..cache.clone()
+        };
+        let not_sofa = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        assert!(matches!(
+            BinauralRenderer::prepare_grid_cache(&not_sofa, &other, 48_000),
+            Err(grid_cache::PrepareError::Unusable(_))
+        ));
+        assert!(!other.path.exists(), "nothing written for a refused file");
+        // A file larger than any HRTF set is refused unread: sparse here, it
+        // would take its whole size in memory were it read.
+        let huge = dir.join("huge.sofa");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(measured::HRTF_MAX_FILE_BYTES + 1)
+            .unwrap();
+        let huge = huge.to_str().unwrap().to_string();
+        match BinauralRenderer::prepare_grid_cache(&huge, &other, 48_000) {
+            Err(grid_cache::PrepareError::Unusable(why)) => {
+                assert!(why.contains("more than the 144 MB"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!other.path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn synchronous_builds_swap_the_grid_on_the_requesting_call() {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<HrirStatus>>> = Default::default();
