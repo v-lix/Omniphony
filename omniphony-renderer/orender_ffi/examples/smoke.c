@@ -40,6 +40,7 @@ int main(void) {
         return 16;
     }
     if (orender_sofa_describe(NULL, 0, NULL, 0) != -3) { puts("FAIL: describe(NULL)"); return 17; }
+    if (orender_hrtf_prepare(NULL, NULL, 48000, 1, NULL, 0) != -3) { puts("FAIL: hrtf_prepare(NULL)"); return 19; }
 
     /* Build id is static and never NULL. */
     const char *build_id = orender_build_id();

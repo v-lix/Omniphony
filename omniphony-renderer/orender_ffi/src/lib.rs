@@ -230,8 +230,10 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     orender_hrir_in_use to name the HRIR set the binaural path convolves
 //     (`brir` while a room does); orender_brir_prepare (carrying the host's
 //     source text in the room) and orender_brir_state for measured rooms; orender_sofa_describe, what a SOFA file or prepared
-//     room holds and which stage takes it; and orender_compose_config for a
-//     host's generated config overridden by a patch its user owns.
+//     room holds and which stage takes it; orender_hrtf_prepare, an HRTF
+//     set's finished grid built ahead of the first session; and
+//     orender_compose_config for a host's generated config overridden by a
+//     patch its user owns.
 pub const ORENDER_ABI_MINOR: u32 = 13;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -875,6 +877,82 @@ fn prepare_room_file(
         -1,
         "SOFA support is not built into this library (the 'sofa' feature)".to_string(),
     ))
+}
+
+/// Build the finished HRIR grid of the SOFA set at `sofa_path` now and keep
+/// it in `grid_path`, as a session would whose `binaural.hrtf_grid_cache` is
+/// `{ path: grid_path, sample_rate, diffuse_field_eq }` - so that a host can
+/// do it when the set is chosen, and the first session at that rate and
+/// setting plays the set from the start instead of after the seconds its
+/// grid takes to build. The grid carries this engine build's stamp, which
+/// is the one a session of this library checks.
+///
+/// `grid_path` may name `{khz}` or `{rate}`, as the config's path does, and
+/// is then the file for `sample_rate`. Nothing is built when it already
+/// holds the grid of these SOFA bytes from this build, for this rate and
+/// setting. The file is written through `<file>.part`, renamed into place.
+///
+/// `summary` (NULL allowed) receives a NUL-terminated line, cut to `cap`
+/// bytes: `grid=built seconds=0.412 bytes=2097200` or `grid=kept
+/// bytes=2097200` on success, the reason otherwise.
+///
+/// Returns 0 when the grid was built and kept, 1 when it was already kept,
+/// -1 when the file cannot be read or is not a set the HRTF stage loads (or
+/// this build has no SOFA support), -2 when the grid cannot be written, -3
+/// on a NULL path or an internal error.
+///
+/// # Safety
+/// `sofa_path` and `grid_path` are NUL-terminated paths; `summary` is NULL or
+/// holds `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_hrtf_prepare(
+    sofa_path: *const c_char,
+    grid_path: *const c_char,
+    sample_rate: u32,
+    diffuse_field_eq: c_int,
+    summary: *mut c_char,
+    cap: u32,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a nul-terminated string (caller contract).
+        let (Some(sofa_path), Some(grid_path)) =
+            (unsafe { opt_str(sofa_path) }, unsafe { opt_str(grid_path) })
+        else {
+            unsafe { write_text(summary, cap, "no SOFA or grid path") };
+            return -3;
+        };
+        let cache = renderer::binaural::grid_cache::GridCache {
+            path: PathBuf::from(grid_path),
+            sample_rate: Some(sample_rate),
+            diffuse_field_eq: diffuse_field_eq != 0,
+            stamp: runtime_control::build_fingerprint(),
+        };
+        let file = cache.file(sample_rate);
+        let started = std::time::Instant::now();
+        let prepared = renderer::binaural::BinauralRenderer::prepare_grid_cache(
+            sofa_path,
+            &cache,
+            sample_rate,
+        );
+        let bytes = || std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        use renderer::binaural::grid_cache::{PrepareError, Prepared};
+        let (code, line) = match prepared {
+            Ok(Prepared::Built) => (
+                0,
+                format!(
+                    "grid=built seconds={:.3} bytes={}",
+                    started.elapsed().as_secs_f32(),
+                    bytes()
+                ),
+            ),
+            Ok(Prepared::Kept) => (1, format!("grid=kept bytes={}", bytes())),
+            Err(PrepareError::Unusable(reason)) => (-1, reason),
+            Err(PrepareError::Write(e)) => (-2, format!("write {}: {e}", file.display())),
+        };
+        unsafe { write_text(summary, cap, &line) };
+        code
+    }))
+    .unwrap_or(-3)
 }
 
 /// Say what a SOFA file or a prepared room holds, and which binaural stage

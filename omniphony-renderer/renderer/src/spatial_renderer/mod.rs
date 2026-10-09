@@ -991,6 +991,8 @@ impl SpatialRenderer {
         if binaural_active {
             let (binaural_params, ears) = {
                 let g = self.control.live.read();
+                self.binaural
+                    .set_grid_cache(g.binaural.hrtf_grid_cache.as_ref());
                 // Compare against the live source in place: no per-frame clone
                 // (the `Sofa` variant carries a heap path), and any rebuild is
                 // pushed to the worker inside `ensure_source`.

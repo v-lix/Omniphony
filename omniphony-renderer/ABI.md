@@ -189,6 +189,18 @@ room=yes|no prepared=yes|no conventions=… measurements=… receivers=…
 emitters=… samples=… rate=…`, then `orientations=… speakers=… names=…` for a
 room, and `reason=…` to its end for the stage that does not take the file.
 
+`orender_hrtf_prepare(sofa_path, grid_path, sample_rate, diffuse_field_eq,
+summary, cap)` builds the finished HRIR grid of a SOFA set now and keeps it
+in `grid_path`, exactly as a session whose `binaural.hrtf_grid_cache` is
+`{ path: grid_path, sample_rate, diffuse_field_eq }` would at its start (a
+`grid_path` naming `{khz}` or `{rate}` is the file for `sample_rate`), so
+that a host can do it when the set is chosen and the first session plays the
+set from its first block. The grid carries this build's stamp; nothing is
+built when the file already holds it. The summary line is `grid=built
+seconds=… bytes=…` or `grid=kept bytes=…`. Returns 0 (built), 1 (already
+kept), -1 (unreadable or not a set the HRTF stage loads, or no SOFA support),
+-2 (cannot write), -3 (NULL path).
+
 A seek (`orender_reset`) now leaves nothing of the previous stream's room:
 the BRIR stage's histories, the reflections and the late reverb are cleared
 in place with the rest of the per-stream state.

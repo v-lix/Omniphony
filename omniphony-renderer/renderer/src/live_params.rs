@@ -636,6 +636,9 @@ pub struct BinauralLiveParams {
     pub hrir_source: crate::binaural::HrirSource,
     /// How finely a direction must change before its HRIR is rebuilt.
     pub hrir_update_lattice: HrirUpdateLattice,
+    /// Where a SOFA set's finished grid is kept between sessions, from the
+    /// config's `binaural.hrtf_grid_cache` (not a live option: the host's).
+    pub hrtf_grid_cache: Option<crate::binaural::grid_cache::GridCache>,
     /// Shoebox early-reflection settings (externalization).
     pub reflections: BinauralReflections,
     /// Late-reverb tail settings (distance / externalization).
@@ -670,6 +673,7 @@ impl Default for BinauralLiveParams {
             tracking: crate::binaural::HeadTracking::default(),
             hrir_source: crate::binaural::HrirSource::default(),
             hrir_update_lattice: HrirUpdateLattice::default(),
+            hrtf_grid_cache: None,
             reflections: BinauralReflections::default(),
             reverb: BinauralReverb::default(),
             air_absorption: true,

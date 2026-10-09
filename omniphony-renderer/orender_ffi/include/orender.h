@@ -285,6 +285,38 @@ int orender_brir_prepare(const uint8_t *sofa,
                          char *summary,
                          uint32_t cap);
 
+// Build the finished HRIR grid of the SOFA set at `sofa_path` now and keep
+// it in `grid_path`, as a session would whose `binaural.hrtf_grid_cache` is
+// `{ path: grid_path, sample_rate, diffuse_field_eq }` - so that a host can
+// do it when the set is chosen, and the first session at that rate and
+// setting plays the set from the start instead of after the seconds its
+// grid takes to build. The grid carries this engine build's stamp, which
+// is the one a session of this library checks.
+//
+// `grid_path` may name `{khz}` or `{rate}`, as the config's path does, and
+// is then the file for `sample_rate`. Nothing is built when it already
+// holds the grid of these SOFA bytes from this build, for this rate and
+// setting. The file is written through `<file>.part`, renamed into place.
+//
+// `summary` (NULL allowed) receives a NUL-terminated line, cut to `cap`
+// bytes: `grid=built seconds=0.412 bytes=2097200` or `grid=kept
+// bytes=2097200` on success, the reason otherwise.
+//
+// Returns 0 when the grid was built and kept, 1 when it was already kept,
+// -1 when the file cannot be read or is not a set the HRTF stage loads (or
+// this build has no SOFA support), -2 when the grid cannot be written, -3
+// on a NULL path or an internal error.
+//
+// # Safety
+// `sofa_path` and `grid_path` are NUL-terminated paths; `summary` is NULL or
+// holds `cap` writable bytes.
+int orender_hrtf_prepare(const char *sofa_path,
+                         const char *grid_path,
+                         uint32_t sample_rate,
+                         int diffuse_field_eq,
+                         char *summary,
+                         uint32_t cap);
+
 // Say what a SOFA file or a prepared room holds, and which binaural stage
 // takes it, before a host copies or prepares anything: its shape and
 // geometry are read, never its responses, so a room set of hundreds of MB

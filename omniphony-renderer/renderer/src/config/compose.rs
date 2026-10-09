@@ -544,6 +544,12 @@ fn check_binaural(value: &Value) -> Result<(), String> {
             "head_tracking" => {
                 return Err("render.binaural.head_tracking: this host has no head tracker".into());
             }
+            "hrtf_grid_cache" => {
+                return Err(
+                    "render.binaural.hrtf_grid_cache: where the HRIR grid is kept is the host's"
+                        .into(),
+                );
+            }
             "mode"
             | "ear_gains"
             | "ear_mutes"
@@ -1160,6 +1166,11 @@ render:
                 "head tracker",
             ),
             ("global:\n  loglevel: debug\n", "render"),
+            (
+                "render:\n  binaural:\n    hrtf_grid_cache:\n      path: /tmp/g\n      \
+                 sample_rate: 48000\n      diffuse_field_eq: true\n",
+                "host's",
+            ),
         ] {
             let why = rejected(patch);
             assert!(why.contains(what), "{patch}: {why}");

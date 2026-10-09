@@ -462,9 +462,26 @@ pub struct BinauralConfig {
     /// [`crate::live_params::HrirUpdateLattice`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hrir_update_lattice: Option<String>,
+    /// A file to keep the finished HRIR grid of `hrtf_sofa_path` in, and the
+    /// sessions it serves (see [`crate::binaural::grid_cache`]). A host's
+    /// key: a patch cannot set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hrtf_grid_cache: Option<HrtfGridCacheConfig>,
     /// See `Config::extra` — preserve unknown keys through round-trips.
     #[serde(flatten, default, skip_serializing_if = "Mapping::is_empty")]
     pub extra: Mapping,
+}
+
+/// `render.binaural.hrtf_grid_cache`: where the finished grid of a SOFA set is
+/// kept, for sessions with `diffuse_field_eq`, at `sample_rate` or, without
+/// it, at every rate - one file per rate where `path` names `{khz}` or
+/// `{rate}` (see [`crate::binaural::grid_cache::GridCache::file`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HrtfGridCacheConfig {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    pub diffuse_field_eq: bool,
 }
 
 impl BinauralConfig {

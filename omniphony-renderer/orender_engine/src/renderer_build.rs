@@ -627,6 +627,10 @@ pub fn seed_runtime_state_from_render_config(
             render,
             &renderer::options::OptionEnv::of(control),
         );
+        // A grid kept by another build of the engine is not used.
+        if let Some(cache) = control.live.write().binaural.hrtf_grid_cache.as_mut() {
+            cache.stamp = runtime_control::build_fingerprint();
+        }
     }
 
     // DRC selection. The decode-side mode is pushed to the bridge lazily by

@@ -3197,6 +3197,16 @@ pub fn seed_live_from_config(live: &mut LiveParams, render: &RenderConfig, env: 
     for spec in LIVE_OPTIONS {
         seed_option(spec, live, render, env);
     }
+    // The host's grid cache, not an option: stamped with this crate's
+    // version until the engine stamps it with its build.
+    live.binaural.hrtf_grid_cache = binaural_cfg(render)
+        .and_then(|b| b.hrtf_grid_cache.as_ref())
+        .map(|c| crate::binaural::grid_cache::GridCache {
+            path: c.path.clone(),
+            sample_rate: c.sample_rate,
+            diffuse_field_eq: c.diffuse_field_eq,
+            stamp: env!("CARGO_PKG_VERSION").to_string(),
+        });
     // Migrate the old phantom boolean + `phantom_params.method` split into the
     // explicit three-position mode. A remembered method remains available even
     // if the old enable switch was off.
