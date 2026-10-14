@@ -6,6 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 
+pub mod check;
 pub(crate) mod unknown_values;
 
 use unknown_values::{EnumKey, KeepsUnknownValues};

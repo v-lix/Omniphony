@@ -232,8 +232,10 @@ pub const ORENDER_ABI_MAJOR: u32 = 0;
 //     (`brir` while a room does); orender_brir_prepare, orender_brir_state
 //     and orender_render_path for measured rooms; orender_sofa_describe, what a
 //     SOFA file or prepared room holds, which stage takes it and the
-//     identity of the file it was made from; and orender_hrtf_prepare, an
-//     HRTF set's finished grid built ahead of the first session.
+//     identity of the file it was made from; orender_hrtf_prepare, an HRTF
+//     set's finished grid built ahead of the first session; and
+//     orender_check_config, a strict check of a config a host built before
+//     it falls back to its own.
 pub const ORENDER_ABI_MINOR: u32 = 13;
 
 /// Speaker-position labels written by `orender_channel_layout` and
@@ -1074,6 +1076,58 @@ fn describe_line(c: &renderer::binaural::brir::SofaContents) -> (String, c_int) 
     }
     let code = c_int::from(hrtf) | if room.is_some() { 2 } else { 0 };
     (line, code)
+}
+
+/// Check a config file before handing it to `orender_create`, for a host
+/// that builds the config itself (for instance from a file its user edits)
+/// and wants to fall back to its own when the result is not one this engine
+/// takes as written.
+///
+/// `orender_create` reads a config leniently: a file that does not parse is
+/// replaced by the defaults, a key this build does not know is kept and
+/// unused, and an option out of its range is clamped or ignored. This check
+/// is strict instead: the file must be one YAML mapping that reads as a
+/// config, every key must be one this build knows, every number finite,
+/// every option the registry bounds in its range and one of its choices, and
+/// a source that names a file (`hrir_source: sofa` / `brir`) must name one
+/// that is there.
+/// Which keys a host leaves to its user is the host's policy, not checked
+/// here. The file is only read, never written; one larger than 1 MiB is
+/// refused unread.
+///
+/// `report` (NULL allowed) receives a NUL-terminated reason when the config is
+/// refused, cut to `cap` bytes; an empty string when it is accepted.
+///
+/// Returns 0 when the config is accepted, -1 when it is refused or cannot be
+/// read (the reason in `report`), -3 on a NULL path or an internal error.
+///
+/// # Safety
+/// `path` is a NUL-terminated path; `report` is NULL or holds `cap` writable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn orender_check_config(
+    path: *const c_char,
+    report: *mut c_char,
+    cap: u32,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: NULL or a nul-terminated string (caller contract).
+        let Some(path) = (unsafe { opt_str(path) }) else {
+            unsafe { write_text(report, cap, "no config path") };
+            return -3;
+        };
+        match renderer::config::check::check_config_file(Path::new(path)) {
+            Ok(()) => {
+                unsafe { write_text(report, cap, "") };
+                0
+            }
+            Err(why) => {
+                unsafe { write_text(report, cap, &why) };
+                -1
+            }
+        }
+    }))
+    .unwrap_or(-3)
 }
 
 /// Constant DSP latency of the rendered output, in samples at the engine
