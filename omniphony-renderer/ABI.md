@@ -225,6 +225,22 @@ A seek (`orender_reset`) now leaves nothing of the previous stream's room:
 the BRIR stage's histories, the reflections and the late reverb are cleared
 in place with the rest of the per-stream state.
 
+### Config check
+
+`orender_check_config(path, report, cap)` checks a config file strictly
+(`renderer::config::check`), for a host that builds the config itself -
+for instance merging a file its user edits over its own - and falls back to
+its own config when the result is refused. `orender_create` reads a config
+leniently (a file that does not parse becomes the defaults, unknown keys are
+kept unused, out-of-range options are clamped or ignored); the check refuses
+instead: one YAML mapping that reads as a config, every key known to this
+build, every number finite, every option within the option registry's
+bounds and among its choices, and a `sofa` / `brir` source naming a file
+that is there. Which keys a host leaves to its user is the host's policy and is not
+checked. The file is only read; one over 1 MiB is refused unread. Returns 0
+(accepted, `report` empty), -1 (refused or unreadable, the reason in
+`report`), -3 (NULL path). `orender_create` itself is unchanged.
+
 The Rust plugin interface is `bridge_api` 0.7, one minor past upstream's 0.6
 for the method described below; its package version is independent of the C
 ABI minor. Rebuild the matching renderer and plugins.

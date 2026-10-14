@@ -399,7 +399,8 @@ macro_rules! declared_options {
             )*
         }
 
-        const DECLARED_KEYS: &[&str] = &[$(stringify!($name)),*];
+        /// The declared options' keys, as they appear in `render`.
+        pub(crate) const DECLARED_KEYS: &[&str] = &[$(stringify!($name)),*];
 
         /// The enum-typed keys of [`DeclaredOptionsConfig`], for the save
         /// side of `config::unknown_values`.

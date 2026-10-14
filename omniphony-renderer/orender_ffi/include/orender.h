@@ -366,6 +366,34 @@ int orender_hrtf_prepare(const char *sofa_path,
 // bytes.
 int orender_sofa_describe(const uint8_t *sofa, uintptr_t len, char *out, uint32_t cap);
 
+// Check a config file before handing it to `orender_create`, for a host
+// that builds the config itself (for instance from a file its user edits)
+// and wants to fall back to its own when the result is not one this engine
+// takes as written.
+//
+// `orender_create` reads a config leniently: a file that does not parse is
+// replaced by the defaults, a key this build does not know is kept and
+// unused, and an option out of its range is clamped or ignored. This check
+// is strict instead: the file must be one YAML mapping that reads as a
+// config, every key must be one this build knows, every number finite,
+// every option the registry bounds in its range and one of its choices, and
+// a source that names a file (`hrir_source: sofa` / `brir`) must name one
+// that is there.
+// Which keys a host leaves to its user is the host's policy, not checked
+// here. The file is only read, never written; one larger than 1 MiB is
+// refused unread.
+//
+// `report` (NULL allowed) receives a NUL-terminated reason when the config is
+// refused, cut to `cap` bytes; an empty string when it is accepted.
+//
+// Returns 0 when the config is accepted, -1 when it is refused or cannot be
+// read (the reason in `report`), -3 on a NULL path or an internal error.
+//
+// # Safety
+// `path` is a NUL-terminated path; `report` is NULL or holds `cap` writable
+// bytes.
+int orender_check_config(const char *path, char *report, uint32_t cap);
+
 // Constant DSP latency of the rendered output, in samples at the engine
 // sample rate: PCM fed to `orender_process` emerges this many samples later
 // in the rendered stream. 0 for the default filters; non-zero when the
